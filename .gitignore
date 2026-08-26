@@ -1,1 +1,15 @@
-__pycache__
+__pycache__/
+.venv/
+
+# secrets - never commit these
+.env
+
+# telethon session files (= full account access)
+*.session
+*.session-journal
+
+# local state
+downloads/
+*.db
+*.db-wal
+*.db-shm
