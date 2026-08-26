@@ -69,6 +69,27 @@ python main.py --workers 5     # override WORKERS from .env
 python main.py --retry-failed  # re-queue videos previously marked failed
 ```
 
+## Speed / VPS tuning
+
+Throughput depends on three things:
+
+1. **`cryptg`** (already in `requirements.txt`) — without it Telethon falls
+   back to a pure-Python AES implementation and downloads crawl at a few
+   hundred KB/s. Verify with `python -c "import cryptg"`.
+2. **Parallelism** — `WORKERS` files transfer at a time, each big file split
+   into `DL_PARTS` / `UL_PARTS` concurrent 512 KiB request stripes (uploads
+   over 10 MiB use them too). On a fast VPS start with `WORKERS=6`,
+   `DL_PARTS=4`, `UL_PARTS=4` and adjust based on the MB/s figures logged
+   every minute. Each in-flight worker holds one file on disk, so keep free
+   space ≥ WORKERS × largest file.
+3. **The account** — Telegram throttles per account server-side; a
+   non-Premium account tops out well below 1 Gbps no matter how fast the VPS
+   is. If MB/s stops rising as you raise WORKERS/DL_PARTS, you have hit that
+   ceiling.
+
+While transfers run, the heartbeat logs both run totals and per-worker
+lines like `w1 download #812 clip.mp4: 41.2 MB / 62.1 MB (8.0 MB/s)`.
+
 ## Notes & limits
 
 - **Account, not bot**: bots can't read chat history, so this logs in as your
@@ -79,8 +100,11 @@ python main.py --retry-failed  # re-queue videos previously marked failed
   `MAX_FILE_SIZE` if you have Premium.
 - **Flood limits**: too many workers triggers `FloodWait` errors. The script
   sleeps them off automatically; keep `WORKERS` around 2–5 for long runs.
-- **Protected content**: channels that forbid saving content
-  (`chat_noforwards`) can't be downloaded from — those items will fail.
+- **Protected content**: channels that forbid forwarding/saving
+  (`chat_noforwards`) block forwarding-based copiers, but this script
+  downloads each file and re-uploads it, which still works for members.
+- **Speed**: see *Speed / VPS tuning* above — most of the perceived slowness
+  is usually the missing `cryptg` package, not Telegram.
 - **What gets copied**: streamable videos, video documents (e.g. `.mp4` sent
   as a file), and photos (each photo in an album is handled individually).
   Photos are re-sent as photos, so Telegram may recompress them; self-destructing

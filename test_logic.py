@@ -9,7 +9,9 @@ script relies on (iter_messages / get_messages / download_media / send_file).
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -81,9 +83,11 @@ class FakeClient:
     async def get_messages(self, entity, ids: int):
         return self.msgs.get(ids)
 
-    async def download_media(self, msg, file: str):
+    async def download_media(self, msg, file: str, progress_callback=None):
         self.downloaded.append(msg.id)
         Path(file).write_bytes(b"x" * 16)
+        if progress_callback:
+            progress_callback(16, 16)
         return file
 
     async def send_file(self, dest, file: str, caption=None, supports_streaming=True):
@@ -107,7 +111,8 @@ def make_ctx(client, tmp: Path, **cfg_overrides):
         setattr(cfg, k, v)
     db = m.Database(cfg.db_path)
     return m.Ctx(client=client, db=db, cfg=cfg, source=object(), dest=object(),
-                 stats={"done": 0, "failed": 0}), cfg
+                 stats={"done": 0, "failed": 0, "bytes_down": 0, "bytes_up": 0,
+                        "t0": time.monotonic()}), cfg
 
 
 def msgs(count: int, video_every: int = 3) -> list[FakeMsg]:
@@ -253,7 +258,7 @@ def test_transfer_floodwait_is_slept_off():
     client.add(FakeMsg(11, has_video=True, name="y.mp4"))
     calls = {"n": 0}
 
-    async def slow_download(msg, file):
+    async def slow_download(msg, file, progress_callback=None):
         calls["n"] += 1
         if calls["n"] == 1:
             raise FloodWaitError(None, capture=0)
@@ -319,6 +324,100 @@ def test_photo_transfer_uses_fallback_name():
             assert not (cfg.download_dir / "job_9").exists()
 
         asyncio.run(run())
+
+
+def test_split_stripes():
+    C = m.CHUNK_SIZE
+    # exact multiple of the chunk: contiguous, chunk-aligned stripes
+    assert m.split_stripes(4 * C, 4) == [(0, C), (C, C), (2 * C, C), (3 * C, C)]
+    # odd size: full coverage without overlap, last stripe short
+    total = 10 * C + 123
+    stripes = m.split_stripes(total, 3)
+    assert stripes == [(0, 4 * C), (4 * C, 4 * C), (8 * C, 2 * C + 123)]
+    assert sum(length for _, length in stripes) == total
+    # fewer chunks than parts collapses to one stripe; empty input to none
+    assert m.split_stripes(1000, 4) == [(0, 1000)]
+    assert m.split_stripes(0, 4) == []
+
+
+def test_parallel_download_assembles_file():
+    class BlobClient(FakeClient):
+        def __init__(self, blob: bytes):
+            super().__init__()
+            self.blob = blob
+
+        def iter_download(self, media, *, offset=0, limit=None,
+                          request_size=None, file_size=None):
+            async def gen():
+                end = min(file_size, offset + limit * request_size)
+                pos = offset
+                while pos < end:
+                    take = min(request_size, end - pos)
+                    yield self.blob[pos:pos + take]
+                    pos += take
+            return gen()
+
+    blob = os.urandom(2 * m.CHUNK_SIZE + 7)   # odd final chunk
+    msg = FakeMsg(5, has_video=True, size=len(blob), name="v.mp4")
+    msg.media = object()
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        path = Path(td) / "v.mp4"
+        seen = {"n": 0}
+
+        async def run():
+            await m.parallel_download(
+                BlobClient(blob), msg, path, len(blob), 3,
+                lambda n: seen.__setitem__("n", seen["n"] + n),
+                min_parallel=1)
+
+        asyncio.run(run())
+        assert path.read_bytes() == blob       # stripes reassembled in order
+        assert seen["n"] == len(blob)
+
+
+def test_parallel_upload_parts():
+    class PartClient:
+        def __init__(self):
+            self.parts: dict[int, bytes] = {}
+            self.file_ids: set = set()
+
+        async def __call__(self, request):
+            self.file_ids.add(request.file_id)
+            self.parts[request.file_part] = request.bytes
+            return True
+
+    data = os.urandom(2 * m.CHUNK_SIZE + 5)   # last part is short
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:
+        path = Path(td) / "v.mp4"
+        path.write_bytes(data)
+        client = PartClient()
+        up = {"n": 0}
+
+        async def run():
+            return await m.parallel_upload(
+                client, path, parts=2,
+                on_bytes=lambda n: up.__setitem__("n", up["n"] + n),
+                big_threshold=1024)
+
+        handle = asyncio.run(run())
+        assert isinstance(handle, m.types.InputFileBig)
+        assert handle.name == "v.mp4"
+        assert handle.parts == 3                      # ceil(size / CHUNK_SIZE)
+        assert client.file_ids == {handle.id}         # one file id for all parts
+        rebuilt = b"".join(client.parts[i] for i in range(handle.parts))
+        assert rebuilt == data                        # no part lost or reordered
+        assert up["n"] == len(data)
+
+        # small files return None so send_file uploads the path itself
+        small = Path(td) / "s.jpg"
+        small.write_bytes(b"tiny")
+
+        async def run_small():
+            return await m.parallel_upload(client, small, parts=4,
+                                           on_bytes=lambda n: None,
+                                           big_threshold=1024)
+
+        assert asyncio.run(run_small()) is None
 
 
 if __name__ == "__main__":

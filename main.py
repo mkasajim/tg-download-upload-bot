@@ -20,12 +20,13 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -45,6 +46,14 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Telegram blocks uploads above this for accounts without Premium (2000 MiB).
 DEFAULT_MAX_SIZE = 2097152000
+
+# Telegram moves at most 512 KiB per GetFile / SaveBigFilePart request, so
+# parallel transfers split files into stripes of such chunks.
+CHUNK_SIZE = 512 * 1024
+# Files below this use the plain single-stream download path.
+MIN_PARALLEL_DOWNLOAD = 4 * 1024 * 1024
+# Telegram only accepts SaveBigFilePart ("big" files) above 10 MiB.
+BIG_FILE_UPLOAD = 10 * 1024 * 1024
 
 SCAN_BATCH = 500  # DB rows buffered before a flush while scanning history
 
@@ -69,6 +78,44 @@ def sanitize_filename(name: Optional[str]) -> Optional[str]:
     return name[:150] or None
 
 
+def _pwrite(fd: int, data: bytes, offset: int) -> None:
+    if hasattr(os, "pwrite"):
+        os.pwrite(fd, data, offset)
+    else:  # Windows: no pread/pwrite; nothing awaits between seek and write
+        os.lseek(fd, offset, os.SEEK_SET)
+        os.write(fd, data)
+
+
+def _pread(fd: int, size: int, offset: int) -> bytes:
+    if hasattr(os, "pread"):
+        return os.pread(fd, size, offset)
+    os.lseek(fd, offset, os.SEEK_SET)
+    return os.read(fd, size)
+
+
+# On Windows os.open() defaults to text mode, where every b"\n" grows into
+# b"\r\n" and corrupts binary media; O_BINARY is 0 where it does not exist.
+BINARY = getattr(os, "O_BINARY", 0)
+
+
+def split_stripes(total: int, parts: int, chunk: int = CHUNK_SIZE) -> list:
+    """Splits `total` bytes into at most `parts` contiguous (offset, length)
+    stripes of whole chunks; totals under one chunk collapse to one stripe."""
+    nchunks = (total + chunk - 1) // chunk
+    parts = max(1, min(parts, nchunks))
+    base, extra = divmod(nchunks, parts)
+    out: list = []
+    start = 0
+    for i in range(parts):
+        take = base + (1 if i < extra else 0)
+        if not take:
+            continue
+        offset = start * chunk
+        out.append((offset, min(total - offset, take * chunk)))
+        start += take
+    return out
+
+
 # ---------------------------------------------------------------------------
 # configuration
 # ---------------------------------------------------------------------------
@@ -87,6 +134,8 @@ class Config:
     session: str
     max_file_size: int
     max_attempts: int
+    dl_parts: int = 4   # concurrent download stripes per file
+    ul_parts: int = 4   # concurrent upload stripes per file
 
 
 def load_env_file(path: Path) -> None:
@@ -151,6 +200,8 @@ def build_config(args: argparse.Namespace) -> Config:
         session=str(session_path),
         max_file_size=env_int("MAX_FILE_SIZE", DEFAULT_MAX_SIZE),
         max_attempts=env_int("MAX_ATTEMPTS", 3),
+        dl_parts=max(1, env_int("DL_PARTS", 4)),
+        ul_parts=max(1, env_int("UL_PARTS", 4)),
     )
 
 
@@ -473,6 +524,89 @@ class Ctx:
     source: Any
     dest: Any
     stats: dict
+    progress: dict = field(default_factory=dict)  # worker_id -> live transfer state
+
+
+async def parallel_download(client: TelegramClient, msg: Any, path: Path,
+                            size: int, parts: int, on_bytes, *,
+                            min_parallel: int = MIN_PARALLEL_DOWNLOAD) -> None:
+    """Download msg's media into path, fetching `parts` byte stripes of the
+    file concurrently (the requests pipeline over the DC connection, which
+    multiplies throughput on fast links). Small files use one plain stream."""
+    stripes = split_stripes(size, parts)
+    if len(stripes) <= 1 or size < min_parallel:
+        seen = {"n": 0}
+
+        def cb(current: int, total: int) -> None:
+            on_bytes(current - seen["n"])
+            seen["n"] = current
+
+        await client.download_media(msg, file=str(path), progress_callback=cb)
+        return
+
+    fd = os.open(str(path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC | BINARY, 0o644)
+    try:
+        os.ftruncate(fd, size)
+
+        async def stripe(offset: int, length: int) -> None:
+            pos = offset
+            stream = client.iter_download(
+                msg.media, offset=offset,
+                limit=(length + CHUNK_SIZE - 1) // CHUNK_SIZE,
+                request_size=CHUNK_SIZE, file_size=size)
+            async for chunk in stream:
+                _pwrite(fd, chunk, pos)
+                pos += len(chunk)
+                on_bytes(len(chunk))
+            if pos - offset < length:
+                raise IOError(f"download stopped early at offset {offset}: "
+                              f"{pos - offset} of {length} bytes")
+
+        tasks = [asyncio.create_task(stripe(*s)) for s in stripes]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+    finally:
+        os.close(fd)
+
+
+async def parallel_upload(client: TelegramClient, path: Path, parts: int,
+                          on_bytes, *, big_threshold: int = BIG_FILE_UPLOAD):
+    """Upload a big file with `parts` concurrent SaveBigFilePart stripes and
+    return its InputFileBig handle (send_file accepts it directly). Returns
+    None for small files, where send_file's own upload of the path is fine."""
+    size = path.stat().st_size
+    if parts <= 1 or size <= big_threshold:
+        return None
+    part_count = (size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    file_id = random.getrandbits(63)
+    fd = os.open(str(path), os.O_RDONLY | BINARY)
+    try:
+        async def stripe(first: int) -> None:
+            for index in range(first, part_count, parts):
+                data = _pread(fd, CHUNK_SIZE, index * CHUNK_SIZE)
+                ok = await client(functions.upload.SaveBigFilePartRequest(
+                    file_id, index, part_count, data))
+                if not ok:
+                    raise RuntimeError(f"server rejected upload part {index}")
+                on_bytes(len(data))
+
+        tasks = [asyncio.create_task(stripe(k))
+                 for k in range(min(parts, part_count))]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+    finally:
+        os.close(fd)
+    return types.InputFileBig(file_id, part_count, path.name)
 
 
 async def transfer_one(ctx: Ctx, worker_id: int, row: sqlite3.Row) -> None:
@@ -493,26 +627,47 @@ async def transfer_one(ctx: Ctx, worker_id: int, row: sqlite3.Row) -> None:
     caption = (msg.raw_text or "")[:1024] or None
     errors = 0
 
+    def begin(phase: str) -> None:
+        ctx.progress[worker_id] = {"mid": mid, "phase": phase, "name": fname,
+                                   "size": size, "bytes": 0,
+                                   "t0": time.monotonic()}
+
+    def on_bytes(stat_key: str):
+        prog = ctx.progress[worker_id]
+
+        def cb(n: int) -> None:
+            prog["bytes"] += n
+            ctx.stats[stat_key] += n
+
+        return cb
+
     while True:
         job_dir = cfg.download_dir / f"job_{mid}"
         path = job_dir / fname
         try:
             job_dir.mkdir(parents=True, exist_ok=True)
 
+            begin("down")
             t0 = time.monotonic()
-            await ctx.client.download_media(msg, file=str(path))
+            await parallel_download(ctx.client, msg, path, size,
+                                    cfg.dl_parts, on_bytes("bytes_down"))
             log.info("%s #%d downloaded %s (%s) in %.1fs",
                      tag, mid, fname, human_size(size), time.monotonic() - t0)
 
             db.set_status(chat_id, mid, "uploading")
+            begin("up")
             t0 = time.monotonic()
+            handle = await parallel_upload(ctx.client, path, cfg.ul_parts,
+                                           on_bytes("bytes_up"))
             sent = await ctx.client.send_file(
-                ctx.dest, str(path), caption=caption, supports_streaming=(kind == "video")
+                ctx.dest, handle if handle is not None else str(path),
+                caption=caption, supports_streaming=(kind == "video")
             )
             log.info("%s #%d uploaded as dest message #%d in %.1fs",
                      tag, mid, sent.id, time.monotonic() - t0)
 
             db.set_status(chat_id, mid, "done", dest_message_id=sent.id)
+            ctx.progress.pop(worker_id, None)
             shutil.rmtree(job_dir, ignore_errors=True)  # free disk space
             ctx.stats["done"] += 1
             return
@@ -560,6 +715,18 @@ async def heartbeat(ctx: Ctx) -> None:
         log.info("progress: %d done, %d pending, %d failed overall (this run: %d ok, %d failed)",
                  c.get("done", 0), c.get("pending", 0), c.get("failed", 0),
                  ctx.stats["done"], ctx.stats["failed"])
+        elapsed = max(1.0, time.monotonic() - ctx.stats["t0"])
+        log.info("run traffic: %s down, %s up (%.1f / %.1f MB/s)",
+                 human_size(ctx.stats["bytes_down"]), human_size(ctx.stats["bytes_up"]),
+                 ctx.stats["bytes_down"] / elapsed / 1e6,
+                 ctx.stats["bytes_up"] / elapsed / 1e6)
+        for wid in sorted(ctx.progress):
+            p = ctx.progress[wid]
+            secs = max(1e-9, time.monotonic() - p["t0"])
+            log.info("  w%d %s #%d %s: %s / %s (%.1f MB/s)",
+                     wid, "download" if p["phase"] == "down" else "upload",
+                     p["mid"], p["name"], human_size(p["bytes"]),
+                     human_size(p["size"]), p["bytes"] / secs / 1e6)
 
 
 def sweep_dir(d: Path) -> int:
@@ -633,7 +800,8 @@ async def main_async(cfg: Config, args: argparse.Namespace) -> int:
 
     dest = await resolve_destination(client, db, cfg)
     ctx = Ctx(client=client, db=db, cfg=cfg, source=source, dest=dest,
-              stats={"done": 0, "failed": 0})
+              stats={"done": 0, "failed": 0, "bytes_down": 0, "bytes_up": 0,
+                     "t0": time.monotonic()})
 
     queue: asyncio.Queue = asyncio.Queue()
     for row in pending_rows:
