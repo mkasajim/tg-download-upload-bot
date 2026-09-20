@@ -11,6 +11,7 @@ Supports:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import shutil
 from pathlib import Path

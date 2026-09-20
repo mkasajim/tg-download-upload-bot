@@ -247,21 +247,20 @@ class TaskRunner:
         self.download_dir = (BASE_DIR / os.environ.get("DOWNLOAD_DIR", "downloads")) / f"task_{self.task_id}"
         self._last_metrics_sync = time.monotonic()
 
-    def _sync_metrics(self, force: bool = False) -> None:
-        """Aggregate task_media counters into the tasks row, throttled.
+    def _log_sync(self, level: str, msg: str) -> None:
+        log.log(getattr(logging, level.upper(), logging.INFO), "[Task %s] %s", self.task_id[:8], msg)
+        self.db.add_log(self.task_id, level.upper(), msg)
 
-        Previously this ran 3 aggregate SELECTs + 1 UPDATE on *every* file,
-        which dominated the DB lock. Now it runs at most every
-        METRICS_SYNC_INTERVAL seconds (or when forced).
-        """
+    def log(self, level: str, msg: str) -> None:
+        # DB write goes to a worker thread so it never blocks the event loop.
+        asyncio.get_running_loop().run_in_executor(None, self._log_sync, level, msg)
+
+    async def _sync_metrics(self, force: bool = False) -> None:
+        """Aggregate task_media counters into the tasks row, throttled (and on a thread)."""
         now = time.monotonic()
         if force or (now - self._last_metrics_sync) >= METRICS_SYNC_INTERVAL:
             self._last_metrics_sync = now
-            self.db.sync_task_metrics(self.task_id)
-
-    def log(self, level: str, msg: str) -> None:
-        log.log(getattr(logging, level.upper(), logging.INFO), "[Task %s] %s", self.task_id[:8], msg)
-        self.db.add_log(self.task_id, level.upper(), msg)
+            await asyncio.to_thread(self.db.sync_task_metrics, self.task_id)
 
     def get_status(self) -> dict:
         now = time.monotonic()
@@ -306,7 +305,7 @@ class TaskRunner:
             entity = await self.client.get_entity(source_ref)
 
         source_title = getattr(entity, "title", None) or getattr(entity, "username", None) or str(source_ref)
-        self.db.update_task(self.task_id, source_id=entity.id, source_title=source_title)
+        await asyncio.to_thread(self.db.update_task, self.task_id, source_id=entity.id, source_title=source_title)
         self.task_info["source_id"] = entity.id
         self.task_info["source_title"] = source_title
         return entity
@@ -348,7 +347,8 @@ class TaskRunner:
             raise ValueError(f"Destination resolved to unsupported peer type: {type(ent).__name__}")
 
         dest_title = getattr(ent, "title", None) or getattr(ent, "username", None) or str(ent.id)
-        self.db.update_task(
+        await asyncio.to_thread(
+            self.db.update_task,
             self.task_id,
             dest_id=ent.id,
             dest_title=dest_title,
@@ -360,7 +360,7 @@ class TaskRunner:
         return peer_from_json(payload)
 
     async def scan_source(self, source: Any, chat_id: int) -> int:
-        self.db.update_task_status(self.task_id, "scanning")
+        await asyncio.to_thread(self.db.update_task_status, self.task_id, "scanning")
         self.log("INFO", f"Starting media scan on source {chat_id}...")
 
         task_data = self.task_info  # already loaded in __init__; avoids a DB round-trip
@@ -396,19 +396,27 @@ class TaskRunner:
                 err,
             ))
 
-        def flush(cursor_col: str, cursor_val: int) -> None:
-            nonlocal added
+        def _flush_sync(cursor_col: str, cursor_val: int, rows_snapshot: list) -> int:
             # Single transaction: batch insert + cursor update = 1 commit
             # instead of 2 (and 1 network round-trip on remote DBs).
             with self.db.batch():
-                if rows:
-                    added += self.db.insert_media(self.task_id, rows)
-                    rows.clear()
+                n = 0
+                if rows_snapshot:
+                    n = self.db.insert_media(self.task_id, rows_snapshot)
                 self.db.update_task(
                     self.task_id,
                     last_seen=last_seen,
                     **{cursor_col: cursor_val},
                 )
+            return n
+
+        async def flush(cursor_col: str, cursor_val: int) -> None:
+            nonlocal added
+            # Run the (network-bound, on remote DBs) flush on a worker thread
+            # so the event loop stays responsive for dashboard requests.
+            snapshot = list(rows)
+            rows.clear()
+            added += await asyncio.to_thread(_flush_sync, cursor_col, cursor_val, snapshot)
 
         async def walk_filter(start: int, stop: int, label: str, cursor_col: str, filter_: Any) -> None:
             """Walk only photo/video messages (server-side filtered).
@@ -429,11 +437,11 @@ class TaskRunner:
                         offer(msg)
                         offset = msg.id
                         if len(rows) >= SCAN_BATCH:
-                            flush(cursor_col, offset)
-                    flush(cursor_col, offset)
+                            await flush(cursor_col, offset)
+                    await flush(cursor_col, offset)
                     return
                 except FloodWaitError as e:
-                    flush(cursor_col, offset)
+                    await flush(cursor_col, offset)
                     self.log("WARNING", f"FloodWait of {e.seconds}s during scan ({label}). Waiting...")
                     await asyncio.sleep(e.seconds + 1)
 
@@ -451,22 +459,22 @@ class TaskRunner:
             self.log("INFO", f"Scanning full history (offset #{scan_cursor})...")
             await walk(scan_cursor, 0, "full index", "scan_cursor")
             if not self.stop_requested and not self.pause_requested:
-                self.db.update_task(self.task_id, scan_complete=1)
-                flush("scan_cursor", 0)
+                await asyncio.to_thread(self.db.update_task, self.task_id, scan_complete=1)
+                await flush("scan_cursor", 0)
                 self.log("INFO", "Full history indexing finished.")
 
         # Catch-up walk for newly posted media
         if not self.stop_requested and not self.pause_requested:
             if catchup_stop == 0:
                 catchup_stop = last_seen
-                self.db.update_task(self.task_id, catchup_stop=catchup_stop)
+                await asyncio.to_thread(self.db.update_task, self.task_id, catchup_stop=catchup_stop)
             self.log("INFO", f"Running catch-up scan for new media since #{catchup_stop}...")
             await walk(catchup_cursor, catchup_stop, "catch-up", "catchup_cursor")
             if not self.stop_requested and not self.pause_requested:
-                self.db.update_task(self.task_id, catchup_stop=last_seen, catchup_cursor=0)
-                flush("catchup_cursor", 0)
+                await asyncio.to_thread(self.db.update_task, self.task_id, catchup_stop=last_seen, catchup_cursor=0)
+                await flush("catchup_cursor", 0)
 
-        self.db.sync_task_metrics(self.task_id)
+        await self._sync_metrics(force=True)
         return added
 
     async def transfer_one(self, worker_id: int, row: dict, source: Any, dest: Any) -> None:
@@ -478,11 +486,11 @@ class TaskRunner:
         ul_parts = int(self.task_info.get("ul_parts") or 4)
         max_attempts = int(os.environ.get("MAX_ATTEMPTS", 3))
 
-        self.db.set_media_status(self.task_id, chat_id, mid, "downloading")
+        await asyncio.to_thread(self.db.set_media_status, self.task_id, chat_id, mid, "downloading")
         msg = await self.client.get_messages(source, ids=mid)
         info = extract_media(msg) if msg else None
         if info is None:
-            self.db.set_media_status(self.task_id, chat_id, mid, "skipped", error="message deleted or not video/photo")
+            await asyncio.to_thread(self.db.set_media_status, self.task_id, chat_id, mid, "skipped", error="message deleted or not video/photo")
             self.log("WARNING", f"#{mid} no longer accessible, skipping.")
             return
 
@@ -524,7 +532,7 @@ class TaskRunner:
                     self.worker_progress.pop(worker_id, None)
                     return
 
-                self.db.set_media_status(self.task_id, chat_id, mid, "uploading")
+                await asyncio.to_thread(self.db.set_media_status, self.task_id, chat_id, mid, "uploading")
                 begin("up")
                 t0 = time.monotonic()
                 handle = await parallel_upload(self.client, path, ul_parts, on_bytes("bytes_up"))
@@ -535,20 +543,20 @@ class TaskRunner:
                     supports_streaming=(kind == "video"),
                 )
 
-                self.db.set_media_status(self.task_id, chat_id, mid, "done", dest_message_id=sent.id)
+                await asyncio.to_thread(self.db.set_media_status, self.task_id, chat_id, mid, "done", dest_message_id=sent.id)
                 self.worker_progress.pop(worker_id, None)
                 shutil.rmtree(job_dir, ignore_errors=True)
                 self.stats["done_this_run"] += 1
-                self._sync_metrics()
+                await self._sync_metrics()
                 return
 
             except FloodWaitError as e:
                 if e.seconds > 3600:
-                    self.db.mark_media_failed(self.task_id, chat_id, mid, f"flood wait too long ({e.seconds}s)")
+                    await asyncio.to_thread(self.db.mark_media_failed, self.task_id, chat_id, mid, f"flood wait too long ({e.seconds}s)")
                     shutil.rmtree(job_dir, ignore_errors=True)
                     self.stats["failed_this_run"] += 1
                     self.worker_progress.pop(worker_id, None)
-                    self._sync_metrics()
+                    await self._sync_metrics()
                     return
                 self.log("WARNING", f"Worker #{worker_id} hit FloodWait of {e.seconds}s. Waiting...")
                 await asyncio.sleep(e.seconds + 1)
@@ -561,10 +569,10 @@ class TaskRunner:
                 self.log("WARNING", f"#{mid} attempt {errors}/{max_attempts} failed: {type(e).__name__}: {e}")
                 shutil.rmtree(job_dir, ignore_errors=True)
                 if errors >= max_attempts:
-                    self.db.mark_media_failed(self.task_id, chat_id, mid, f"{type(e).__name__}: {e}")
+                    await asyncio.to_thread(self.db.mark_media_failed, self.task_id, chat_id, mid, f"{type(e).__name__}: {e}")
                     self.stats["failed_this_run"] += 1
                     self.worker_progress.pop(worker_id, None)
-                    self._sync_metrics()
+                    await self._sync_metrics()
                     return
                 await asyncio.sleep(min(2 ** errors, 30))
 
@@ -611,7 +619,7 @@ class TaskRunner:
         # Step 1: Clean up any partial files from prior crash/run
         self.download_dir.mkdir(parents=True, exist_ok=True)
         self.sweep_dir()
-        self.db.reset_incomplete_media(self.task_id)
+        await asyncio.to_thread(self.db.reset_incomplete_media, self.task_id)
 
         try:
             # Step 2: Resolve Telegram peers
@@ -624,13 +632,13 @@ class TaskRunner:
                 return
 
             # Step 4: Transfer queue
-            self.db.update_task_status(self.task_id, "running")
-            pending_rows = self.db.get_pending_media(self.task_id)
+            await asyncio.to_thread(self.db.update_task_status, self.task_id, "running")
+            pending_rows = await asyncio.to_thread(self.db.get_pending_media, self.task_id)
             self.log("INFO", f"Queuing {len(pending_rows)} pending media items for transfer...")
 
             if not pending_rows:
                 self.log("INFO", "No pending items to transfer. Task marked completed.")
-                self.db.update_task_status(self.task_id, "completed")
+                await asyncio.to_thread(self.db.update_task_status, self.task_id, "completed")
                 return
 
             queue: asyncio.Queue = asyncio.Queue()
@@ -651,7 +659,7 @@ class TaskRunner:
                     w.cancel()
                 await asyncio.gather(*self.active_workers, return_exceptions=True)
                 self.sweep_dir()
-                self.db.reset_incomplete_media(self.task_id)
+                await asyncio.to_thread(self.db.reset_incomplete_media, self.task_id)
                 return
 
             await queue.join()
@@ -659,40 +667,40 @@ class TaskRunner:
                 queue.put_nowait(None)
             await asyncio.gather(*self.active_workers, return_exceptions=True)
 
-            counts = self.db.get_task_counts(self.task_id)
+            counts = await asyncio.to_thread(self.db.get_task_counts, self.task_id)
             if counts["pending"] == 0:
-                self.db.update_task_status(self.task_id, "completed")
+                await asyncio.to_thread(self.db.update_task_status, self.task_id, "completed")
                 self.log("INFO", f"Task finished: {counts['done']} done, {counts['failed']} failed.")
             else:
-                self.db.update_task_status(self.task_id, "paused")
+                await asyncio.to_thread(self.db.update_task_status, self.task_id, "paused")
 
         except asyncio.CancelledError:
             self.log("INFO", "Task was cancelled/interrupted.")
             self.sweep_dir()
-            self.db.reset_incomplete_media(self.task_id)
+            await asyncio.to_thread(self.db.reset_incomplete_media, self.task_id)
             raise
         except Exception as e:
             self.log("ERROR", f"Task fatal error: {type(e).__name__}: {e}")
-            self.db.update_task_status(self.task_id, "failed", error_message=str(e))
+            await asyncio.to_thread(self.db.update_task_status, self.task_id, "failed", error_message=str(e))
             self.sweep_dir()
-            self.db.reset_incomplete_media(self.task_id)
+            await asyncio.to_thread(self.db.reset_incomplete_media, self.task_id)
         finally:
             self.worker_progress.clear()
-            self._sync_metrics(force=True)
-            self.db.flush()
+            await self._sync_metrics(force=True)
+            await asyncio.to_thread(self.db.flush)
 
     async def pause(self) -> None:
         self.pause_requested = True
-        self.db.update_task_status(self.task_id, "paused")
-        self.db.flush()
+        await asyncio.to_thread(self.db.update_task_status, self.task_id, "paused")
+        await asyncio.to_thread(self.db.flush)
         self.log("INFO", "Task pause requested.")
         for w in self.active_workers:
             w.cancel()
 
     async def stop(self) -> None:
         self.stop_requested = True
-        self.db.update_task_status(self.task_id, "stopped")
-        self.db.flush()
+        await asyncio.to_thread(self.db.update_task_status, self.task_id, "stopped")
+        await asyncio.to_thread(self.db.flush)
         self.log("INFO", "Task stop requested.")
         for w in self.active_workers:
             w.cancel()
