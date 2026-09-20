@@ -13,3 +13,4 @@ downloads/
 *.db
 *.db-wal
 *.db-shm
+*.zip
