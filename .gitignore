@@ -10,6 +10,7 @@ __pycache__/
 
 # local state
 downloads/
+cert/
 *.db
 *.db-wal
 *.db-shm

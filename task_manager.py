@@ -14,6 +14,8 @@ import asyncio
 import concurrent.futures
 import logging
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -24,6 +26,13 @@ from task_runner import BASE_DIR, TaskRunner
 
 log = logging.getLogger("tg-manager")
 
+# Seconds a list_all_tasks() result is reused. The dashboard fires
+# /api/status + /api/tasks (and media/logs polls) within milliseconds of
+# each other every 3 s — without this each of those is a separate DB
+# round-trip. Live worker telemetry is merged fresh on every call
+# (in-memory, microseconds), so only the DB rows are cached.
+TASKS_CACHE_TTL = 2.0
+
 
 class TaskManager:
     def __init__(self, db: Database, client: TelegramClient):
@@ -31,6 +40,14 @@ class TaskManager:
         self.client = client
         self.active_runners: dict[str, TaskRunner] = {}
         self.async_tasks: dict[str, asyncio.Task] = {}
+        self._tasks_cache: Optional[list[dict]] = None
+        self._tasks_cache_ts: float = 0.0
+        self._cache_lock = threading.Lock()
+
+    def invalidate_cache(self) -> None:
+        """Drop the cached task list (call after any mutation)."""
+        with self._cache_lock:
+            self._tasks_cache = None
 
     def startup_recovery(self) -> int:
         """Called when server starts. Recovers tasks interrupted by server shutdown/crash."""
@@ -67,6 +84,7 @@ class TaskManager:
                 self.async_tasks.pop(task_id, None)
 
         self.async_tasks[task_id] = asyncio.create_task(_run())
+        self.invalidate_cache()
         return await asyncio.to_thread(self.get_task_details, task_id)
 
     async def pause_task(self, task_id: str) -> dict:
@@ -76,6 +94,7 @@ class TaskManager:
         else:
             await asyncio.to_thread(self.db.update_task_status, task_id, "paused")
             self.db.flush()
+        self.invalidate_cache()
         return await asyncio.to_thread(self.get_task_details, task_id)
 
     async def resume_task(self, task_id: str) -> dict:
@@ -88,11 +107,13 @@ class TaskManager:
         else:
             await asyncio.to_thread(self.db.update_task_status, task_id, "stopped")
             self.db.flush()
+        self.invalidate_cache()
         return await asyncio.to_thread(self.get_task_details, task_id)
 
     def retry_failed(self, task_id: str) -> dict:
         requeued = self.db.retry_failed_media(task_id)
         self.db.add_log(task_id, "INFO", f"Re-queued {requeued} failed media item(s).")
+        self.invalidate_cache()
         return self.get_task_details(task_id)
 
     async def delete_task(self, task_id: str) -> bool:
@@ -110,7 +131,9 @@ class TaskManager:
         if task_dir.exists():
             shutil.rmtree(task_dir, ignore_errors=True)
 
-        return self.db.delete_task(task_id)
+        ok = self.db.delete_task(task_id)
+        self.invalidate_cache()
+        return ok
 
     def get_task_details(self, task_id: str) -> Optional[dict]:
         task = self.db.get_task(task_id)
@@ -141,10 +164,23 @@ class TaskManager:
         return task
 
     def list_all_tasks(self) -> list[dict]:
-        # Single aggregate query for all tasks + counts (was N+1 per task).
-        tasks = self.db.list_tasks_with_counts()
+        # DB rows are cached for TASKS_CACHE_TTL so the dashboard's
+        # simultaneous /api/status + /api/tasks polls share ONE query.
+        # Live runner telemetry is merged fresh on every call.
+        now = time.monotonic()
+        with self._cache_lock:
+            cached = (
+                self._tasks_cache
+                if self._tasks_cache is not None and (now - self._tasks_cache_ts) < TASKS_CACHE_TTL
+                else None
+            )
+        if cached is None:
+            cached = self.db.list_tasks_with_counts()
+            with self._cache_lock:
+                self._tasks_cache = cached
+                self._tasks_cache_ts = now
         res = []
-        for t in tasks:
+        for t in cached:
             task = dict(t)
             runner = self.active_runners.get(task["id"])
             if runner:

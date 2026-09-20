@@ -119,6 +119,76 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(counts_retried["failed"], 0)
         self.assertEqual(counts_retried["pending"], 1)
 
+    def test_incremental_counters(self):
+        # Chunked multi-row insert keeps exact counters (incl. skips)...
+        self.database.create_task(task_id="t_004", name="Counter Task", source_peer="@src")
+        rows = [
+            (1001, i, f"f{i}.mp4", 1000 + i, None,
+             "skipped" if i % 5 == 0 else "pending",
+             "big" if i % 5 == 0 else None)
+            for i in range(350)  # spans multiple INSERT_CHUNK batches
+        ]
+        self.assertEqual(self.database.insert_media("t_004", rows), 350)
+        t = self.database.get_task("t_004")
+        self.assertEqual(t["total_items"], 350)
+        self.assertEqual(t["skipped_items"], 70)
+        exp_pending = sum(1000 + i for i in range(350) if i % 5 != 0)
+        self.assertEqual(t["pending_bytes"], exp_pending)
+
+        # ...resume re-inserts are ignored and don't move counters...
+        self.assertEqual(self.database.insert_media("t_004", rows), 0)
+        self.assertEqual(self.database.get_task("t_004")["total_items"], 350)
+
+        # ...status transitions bump terminal counters only...
+        self.database.set_media_status("t_004", 1001, 1, "downloading")
+        self.assertEqual(self.database.get_task("t_004")["pending_bytes"], exp_pending)
+        self.database.set_media_status("t_004", 1001, 1, "done", dest_message_id=9, size=1001)
+        self.database.set_media_status("t_004", 1001, 2, "skipped", error="gone", size=1002)
+        self.database.mark_media_failed("t_004", 1001, 3, "boom", size=1003)
+        t = self.database.get_task("t_004")
+        self.assertEqual(t["done_items"], 1)
+        self.assertEqual(t["done_bytes"], 1001)
+        self.assertEqual(t["skipped_items"], 71)
+        self.assertEqual(t["failed_items"], 1)
+        self.assertEqual(t["pending_bytes"], exp_pending - 1001 - 1002 - 1003)
+
+        # ...and the full aggregate agrees with the incremental counters.
+        c = self.database.get_task_counts("t_004")
+        self.assertEqual(c["total"], t["total_items"])
+        self.assertEqual(c["done"], t["done_items"])
+        self.assertEqual(c["failed"], t["failed_items"])
+        self.assertEqual(c["skipped"], t["skipped_items"])
+        self.assertEqual(c["pending_bytes"], t["pending_bytes"])
+        self.assertEqual(c["done_bytes"], t["done_bytes"])
+
+        # Dashboard read serves the precomputed counters (no aggregate).
+        listed = self.database.list_tasks_with_counts()
+        row = next(r for r in listed if r["id"] == "t_004")
+        self.assertEqual(row["total_items"], 350)
+        self.assertEqual(row["done_items"], 1)
+
+    def test_pending_media_pages(self):
+        self.database.create_task(task_id="t_005", name="Paged Task", source_peer="@src")
+        self.database.insert_media(
+            "t_005",
+            [(2002, i, f"g{i}.mp4", 10, None, "pending", None) for i in range(2500)],
+        )
+        pages, last = [], -1
+        while True:
+            page = self.database.get_pending_media_page("t_005", last, 1000)
+            if not page:
+                break
+            pages.append(page)
+            last = page[-1]["message_id"]
+            if len(page) < 1000:
+                break
+        ids = [r["message_id"] for p in pages for r in p]
+        self.assertEqual(len(ids), 2500)
+        self.assertEqual(ids, list(range(2500)))
+        self.assertEqual(
+            set(pages[0][0].keys()), {"chat_id", "message_id", "file_name", "file_size"}
+        )
+
 
 class TestCloudflareTunnel(unittest.TestCase):
     def test_find_cloudflared(self):

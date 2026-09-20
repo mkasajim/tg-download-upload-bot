@@ -146,7 +146,10 @@ def test_full_scan_and_catchup():
             added = await m.scan_source(ctx.client, ctx.db, ctx.cfg, ctx.source, chat_id)
             assert added == 6, added
             assert ctx.db.get_meta("1:scan_complete") == "1"
-            assert ctx.db.get_meta("1:last_seen") == "20"
+            # last_seen tracks the newest *media* message: the walk uses
+            # server-side photo/video filters, so text messages (19, 20)
+            # are never yielded. Newest video here is #18.
+            assert ctx.db.get_meta("1:last_seen") == "18"
             assert len(ctx.db.pending()) == 6
             # rerun: nothing new
             assert await m.scan_source(ctx.client, ctx.db, ctx.cfg, ctx.source, chat_id) == 0

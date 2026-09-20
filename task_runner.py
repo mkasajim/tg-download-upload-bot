@@ -38,7 +38,8 @@ CHUNK_SIZE = 512 * 1024
 MIN_PARALLEL_DOWNLOAD = 4 * 1024 * 1024
 BIG_FILE_UPLOAD = 10 * 1024 * 1024
 SCAN_BATCH = 200  # flush cadence for the dashboard media list; each flush is one batched commit
-METRICS_SYNC_INTERVAL = 5.0  # seconds between task_media metric syncs (was per-file)
+QUEUE_PAGE = 2000  # pending-queue feeder page size (keyset pages via idx_tm_task_msg)
+QUEUE_MAX = 4000  # max in-memory queued items (backpressure for the feeder)
 
 BINARY = getattr(os, "O_BINARY", 0)
 
@@ -236,6 +237,7 @@ class TaskRunner:
         self.stop_requested = False
         self.pause_requested = False
         self.active_workers: list[asyncio.Task] = []
+        self.feeder_task: Optional[asyncio.Task] = None
         self.worker_progress: dict[int, dict] = {}
         self.stats = {
             "bytes_down": 0,
@@ -257,10 +259,14 @@ class TaskRunner:
         asyncio.get_running_loop().run_in_executor(None, self._log_sync, level, msg)
 
     async def _sync_metrics(self, force: bool = False) -> None:
-        """Aggregate task_media counters into the tasks row, throttled (and on a thread)."""
-        now = time.monotonic()
-        if force or (now - self._last_metrics_sync) >= METRICS_SYNC_INTERVAL:
-            self._last_metrics_sync = now
+        """Reconcile task_media counters into the tasks row (heavy query).
+
+        Only ever called with force=True (scan end, task end): hot paths
+        maintain counters incrementally, so the old every-5-seconds full
+        aggregate (3 table scans per sync) is gone.
+        """
+        if force:
+            self._last_metrics_sync = time.monotonic()
             await asyncio.to_thread(self.db.sync_task_metrics, self.task_id)
 
     def get_status(self) -> dict:
@@ -491,7 +497,10 @@ class TaskRunner:
         msg = await self.client.get_messages(source, ids=mid)
         info = extract_media(msg) if msg else None
         if info is None:
-            await asyncio.to_thread(self.db.set_media_status, self.task_id, chat_id, mid, "skipped", error="message deleted or not video/photo")
+            await asyncio.to_thread(
+                self.db.set_media_status, self.task_id, chat_id, mid, "skipped",
+                error="message deleted or not video/photo", size=size,
+            )
             self.log("WARNING", f"#{mid} no longer accessible, skipping.")
             return
 
@@ -544,20 +553,27 @@ class TaskRunner:
                     supports_streaming=(kind == "video"),
                 )
 
-                await asyncio.to_thread(self.db.set_media_status, self.task_id, chat_id, mid, "done", dest_message_id=sent.id)
+                await asyncio.to_thread(
+                    self.db.set_media_status, self.task_id, chat_id, mid, "done",
+                    dest_message_id=sent.id, size=size,
+                )
                 self.worker_progress.pop(worker_id, None)
                 shutil.rmtree(job_dir, ignore_errors=True)
                 self.stats["done_this_run"] += 1
-                await self._sync_metrics()
+                # No periodic metrics sync: tasks counters are bumped
+                # incrementally inside set_media_status; the full
+                # aggregate runs only at task end (see run() finally).
                 return
 
             except FloodWaitError as e:
                 if e.seconds > 3600:
-                    await asyncio.to_thread(self.db.mark_media_failed, self.task_id, chat_id, mid, f"flood wait too long ({e.seconds}s)")
+                    await asyncio.to_thread(
+                        self.db.mark_media_failed, self.task_id, chat_id, mid,
+                        f"flood wait too long ({e.seconds}s)", size=size,
+                    )
                     shutil.rmtree(job_dir, ignore_errors=True)
                     self.stats["failed_this_run"] += 1
                     self.worker_progress.pop(worker_id, None)
-                    await self._sync_metrics()
                     return
                 self.log("WARNING", f"Worker #{worker_id} hit FloodWait of {e.seconds}s. Waiting...")
                 await asyncio.sleep(e.seconds + 1)
@@ -570,10 +586,12 @@ class TaskRunner:
                 self.log("WARNING", f"#{mid} attempt {errors}/{max_attempts} failed: {type(e).__name__}: {e}")
                 shutil.rmtree(job_dir, ignore_errors=True)
                 if errors >= max_attempts:
-                    await asyncio.to_thread(self.db.mark_media_failed, self.task_id, chat_id, mid, f"{type(e).__name__}: {e}")
+                    await asyncio.to_thread(
+                        self.db.mark_media_failed, self.task_id, chat_id, mid,
+                        f"{type(e).__name__}: {e}", size=size,
+                    )
                     self.stats["failed_this_run"] += 1
                     self.worker_progress.pop(worker_id, None)
-                    await self._sync_metrics()
                     return
                 await asyncio.sleep(min(2 ** errors, 30))
 
@@ -661,41 +679,76 @@ class TaskRunner:
             if self.stop_requested or self.pause_requested:
                 return
 
-            # Step 4: Transfer queue
+            # Step 4: Transfer queue — fed lazily in keyset pages so a
+            # deep pending queue never materializes as one giant fetch
+            # (the old code SELECT *-ed every pending row up front).
             await asyncio.to_thread(self.db.update_task_status, self.task_id, "running")
-            pending_rows = await asyncio.to_thread(self.db.get_pending_media, self.task_id)
-            self.log("INFO", f"Queuing {len(pending_rows)} pending media items for transfer...")
 
-            if not pending_rows:
-                self.log("INFO", "No pending items to transfer. Task marked completed.")
-                await self._set_status("completed")
-                return
+            queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_MAX)
+            feed_done = asyncio.Event()
+            queued = {"n": 0}
 
-            queue: asyncio.Queue = asyncio.Queue()
-            for r in pending_rows:
-                queue.put_nowait(r)
+            async def feeder() -> None:
+                last_id = -1  # keyset cursor; message_id > last_id (ids start at 1, -1 is exact)
+                try:
+                    while not self.stop_requested and not self.pause_requested:
+                        page = await asyncio.to_thread(
+                            self.db.get_pending_media_page,
+                            self.task_id, last_id, QUEUE_PAGE,
+                        )
+                        if not page:
+                            break
+                        for r in page:
+                            if self.stop_requested or self.pause_requested:
+                                return
+                            await queue.put(r)
+                            queued["n"] += 1
+                        last_id = page[-1]["message_id"]
+                        if len(page) < QUEUE_PAGE:
+                            break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    log.error("[Task %s] queue feeder failed: %s", self.task_id[:8], e)
+                    self.log("ERROR", f"Pending-queue loader failed: {e}")
+                finally:
+                    feed_done.set()
 
             workers_count = int(self.task_info.get("workers") or 3)
+            self.feeder_task = asyncio.create_task(feeder())
             self.active_workers = [
                 asyncio.create_task(self.worker_loop(i + 1, queue, source, dest))
                 for i in range(workers_count)
             ]
+            try:
+                while (
+                    not (feed_done.is_set() and queue.empty())
+                    and not self.stop_requested
+                    and not self.pause_requested
+                ):
+                    await asyncio.sleep(1)
 
-            while not queue.empty() and not self.stop_requested and not self.pause_requested:
-                await asyncio.sleep(1)
+                if self.stop_requested or self.pause_requested:
+                    self.feeder_task.cancel()
+                    for w in self.active_workers:
+                        w.cancel()
+                    await asyncio.gather(self.feeder_task, *self.active_workers, return_exceptions=True)
+                    self.sweep_dir()
+                    await asyncio.to_thread(self.db.reset_incomplete_media, self.task_id)
+                    return
 
-            if self.stop_requested or self.pause_requested:
-                for w in self.active_workers:
-                    w.cancel()
+                await queue.join()
+                for _ in self.active_workers:
+                    queue.put_nowait(None)
                 await asyncio.gather(*self.active_workers, return_exceptions=True)
-                self.sweep_dir()
-                await asyncio.to_thread(self.db.reset_incomplete_media, self.task_id)
-                return
+            finally:
+                if self.feeder_task and not self.feeder_task.done():
+                    self.feeder_task.cancel()
+                    await asyncio.gather(self.feeder_task, return_exceptions=True)
+                self.feeder_task = None
 
-            await queue.join()
-            for _ in self.active_workers:
-                queue.put_nowait(None)
-            await asyncio.gather(*self.active_workers, return_exceptions=True)
+            if queued["n"] == 0:
+                self.log("INFO", "No pending items to transfer. Task marked completed.")
 
             counts = await asyncio.to_thread(self.db.get_task_counts, self.task_id)
             if counts["pending"] == 0:
@@ -706,6 +759,9 @@ class TaskRunner:
 
         except asyncio.CancelledError:
             self.log("INFO", "Task was cancelled/interrupted.")
+            if self.feeder_task and not self.feeder_task.done():
+                self.feeder_task.cancel()
+                await asyncio.gather(self.feeder_task, return_exceptions=True)
             self.sweep_dir()
             await asyncio.to_thread(self.db.reset_incomplete_media, self.task_id)
             raise
@@ -725,6 +781,8 @@ class TaskRunner:
         await self._set_status("paused")
         await asyncio.to_thread(self.db.flush)
         self.log("INFO", "Task pause requested.")
+        if self.feeder_task and not self.feeder_task.done():
+            self.feeder_task.cancel()
         for w in self.active_workers:
             w.cancel()
 
@@ -733,5 +791,7 @@ class TaskRunner:
         await self._set_status("stopped")
         await asyncio.to_thread(self.db.flush)
         self.log("INFO", "Task stop requested.")
+        if self.feeder_task and not self.feeder_task.done():
+            self.feeder_task.cancel()
         for w in self.active_workers:
             w.cancel()

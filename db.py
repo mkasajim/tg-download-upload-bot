@@ -28,6 +28,13 @@ except ImportError:
 
 log = logging.getLogger("tg-db")
 
+# Rows per multi-row INSERT statement. Each row costs 9 bound parameters, so
+# 150 rows = 1350 params (verified fine on Turso remote; keeps the HTTP
+# payload small). CRITICAL: never use executemany() against a remote
+# LibSQL/Turso connection — the client sends one HTTP round-trip PER ROW
+# (measured 20-74 s per 200 rows vs ~0.25 s as one multi-row statement).
+INSERT_CHUNK = int(os.environ.get("DB_INSERT_CHUNK", "150"))
+
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -147,7 +154,16 @@ class Database:
             )
             cur.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_tm_task_status ON task_media (task_id, status);
+                CREATE INDEX IF NOT EXISTS idx_tm_task_status_size ON task_media (task_id, status, file_size);
+                """
+            )
+            # idx_tm_task_status is subsumed by the covering index above
+            # (same leftmost prefix); dropping it cuts per-insert index
+            # maintenance on the hot scan path.
+            cur.execute("DROP INDEX IF EXISTS idx_tm_task_status")
+            cur.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_tm_task_msg ON task_media (task_id, message_id);
                 """
             )
             cur.execute(
@@ -317,40 +333,19 @@ class Database:
             return [self._row_to_dict(r, cur) for r in rows]
 
     def list_tasks_with_counts(self) -> list[dict]:
-        """All tasks plus live media counts in a single aggregate query.
+        """All tasks with their media counters — WITHOUT scanning task_media.
 
-        Replaces the previous N+1 pattern (list_tasks + get_task per task +
-        get_task_counts per task) that serialized on the DB lock for every
-        dashboard poll.
+        Counters in the tasks row are maintained incrementally on every
+        write (insert_media / set_media_status / mark_media_failed) and
+        reconciled by sync_task_metrics at scan end, task end, retry,
+        reset and server startup. The previous implementation ran a
+        GROUP BY aggregate over every task_media row on EVERY dashboard
+        poll (2x per 3 s cycle) — that single query was responsible for
+        the ~18M rows-read metering and much of the dashboard slowness.
         """
         with self.lock:
             cur = self.conn.cursor()
-            cur.execute(
-                """
-                SELECT
-                    t.*,
-                    COALESCE(c.total_items, 0)   AS total_items,
-                    COALESCE(c.done_items, 0)    AS done_items,
-                    COALESCE(c.failed_items, 0)  AS failed_items,
-                    COALESCE(c.skipped_items, 0) AS skipped_items,
-                    COALESCE(c.pending_bytes, 0) AS pending_bytes,
-                    COALESCE(c.done_bytes, 0)    AS done_bytes
-                FROM tasks t
-                LEFT JOIN (
-                    SELECT
-                        task_id,
-                        COUNT(*) AS total_items,
-                        SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_items,
-                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_items,
-                        SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_items,
-                        SUM(CASE WHEN status = 'pending' THEN COALESCE(file_size, 0) ELSE 0 END) AS pending_bytes,
-                        SUM(CASE WHEN status = 'done' THEN COALESCE(file_size, 0) ELSE 0 END) AS done_bytes
-                    FROM task_media
-                    GROUP BY task_id
-                ) c ON c.task_id = t.id
-                ORDER BY t.created_at DESC
-                """
-            )
+            cur.execute("SELECT * FROM tasks ORDER BY created_at DESC")
             rows = cur.fetchall()
             return [self._row_to_dict(r, cur) for r in rows]
 
@@ -381,30 +376,94 @@ class Database:
     # Media Progress Management
     # -----------------------------------------------------------------------
 
+    def _bump_locked(self, cur: Any, task_id: str, deltas: dict) -> None:
+        """Counter UPDATE with the DB lock already held (see below)."""
+        parts: list[str] = []
+        vals: list = []
+        for col in ("total_items", "done_items", "failed_items", "skipped_items"):
+            d = int(deltas.get(col, 0))
+            if d:
+                parts.append(f"{col} = {col} + ?")
+                vals.append(d)
+        for col in ("pending_bytes", "done_bytes"):
+            d = int(deltas.get(col, 0))
+            if d:
+                parts.append(f"{col} = MAX({col} + ?, 0)")
+                vals.append(d)
+        if not parts:
+            return
+        parts.append("updated_at = ?")
+        vals.extend([utcnow(), task_id])
+        cur.execute(f"UPDATE tasks SET {', '.join(parts)} WHERE id = ?", vals)
+
+    def bump_task_counters(self, task_id: str, **deltas: int) -> None:
+        """Incrementally adjust the precomputed counters on the tasks row.
+
+        Single UPDATE, no task_media scan — this is what keeps the
+        dashboard cheap: counters stay live on every write and the
+        dashboard reads them with a 1-row SELECT. Negative byte totals
+        are clamped at 0 so a missed event can never drive a counter
+        negative.
+        """
+        if not any(int(v) for v in deltas.values()):
+            return
+        with self.lock:
+            cur = self.conn.cursor()
+            self._bump_locked(cur, task_id, deltas)
+            self._commit_deferred()
+
     def insert_media(self, task_id: str, rows: list) -> int:
         """
         rows: [(chat_id, message_id, file_name, file_size, date, status, error), ...]
-        Existing items are ignored.
+        Existing items are ignored (INSERT OR IGNORE) and do NOT affect
+        counters — only actually-inserted rows are counted, via RETURNING.
         """
         if not rows:
             return 0
         now = utcnow()
-        payload = [(task_id,) + tuple(r) + (now,) for r in rows]
+        cols = (
+            "(task_id, chat_id, message_id, file_name, file_size, "
+            "date, status, error, updated_at)"
+        )
+        inserted = 0
+        pending_bytes = 0
+        skipped_items = 0
         with self.lock:
             cur = self.conn.cursor()
-            cur.executemany(
-                """
-                INSERT OR IGNORE INTO task_media (
-                    task_id, chat_id, message_id, file_name, file_size, date, status, error, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                payload,
-            )
-            count = cur.rowcount if hasattr(cur, "rowcount") and cur.rowcount > 0 else len(rows)
+            for base in range(0, len(rows), INSERT_CHUNK):
+                chunk = rows[base:base + INSERT_CHUNK]
+                payload = [(task_id,) + tuple(r) + (now,) for r in chunk]
+                ph = ",".join(["(?,?,?,?,?,?,?,?,?)"] * len(payload))
+                # One statement per chunk = one network round-trip on
+                # remote DBs (vs one per row with executemany). RETURNING
+                # yields exactly the rows that were inserted (OR IGNORE
+                # skips re-scans), so counters stay exact across resumes.
+                cur.execute(
+                    f"INSERT OR IGNORE INTO task_media {cols} "
+                    f"VALUES {ph} RETURNING status, file_size",
+                    [v for r in payload for v in r],
+                )
+                for st, sz in cur.fetchall():
+                    inserted += 1
+                    if st == "pending":
+                        pending_bytes += int(sz or 0)
+                    elif st == "skipped":
+                        skipped_items += 1
             self._commit_deferred()
+        if inserted:
+            # Same lock scope as the inserts above (uses the _bump_locked
+            # variant to avoid re-acquiring): cheap, exact, and keeps the
+            # dashboard live during long scans.
+            self._bump_locked(
+                cur,
+                task_id,
+                {"total_items": inserted,
+                 "skipped_items": skipped_items,
+                 "pending_bytes": pending_bytes},
+            )
         # NOTE: sync_task_metrics is intentionally NOT called per insert.
         # Scans flush hundreds of batches; callers sync once at the end.
-        return count
+        return inserted
 
     def set_media_status(
         self,
@@ -415,7 +474,21 @@ class Database:
         *,
         dest_message_id: Optional[int] = None,
         error: Optional[str] = None,
+        size: Optional[int] = None,
     ) -> None:
+        """Mark one media row. Terminal states ('done'/'skipped') also bump
+        the precomputed tasks counters so the dashboard never needs a
+        full-table aggregate.
+
+        Counter semantics: pending_bytes = bytes not yet done/failed/
+        skipped (includes in-flight downloading/uploading rows — that is
+        what the dashboard shows as "Remaining"). So intermediate states
+        need no counter change; only terminal transitions bump:
+          uploading -> done    : done+1, done_bytes+=size, pending_bytes-=size
+          downloading -> skipped (gone): skipped+1, pending_bytes-=size
+        `size` should be the file's byte size (callers know it); without
+        it only the item counts bump and the next reconcile heals bytes.
+        """
         with self.lock:
             cur = self.conn.cursor()
             cur.execute(
@@ -429,9 +502,23 @@ class Database:
                 """,
                 (status, dest_message_id, error, utcnow(), task_id, chat_id, message_id),
             )
+            if status == "done":
+                self._bump_locked(cur, task_id, {
+                    "done_items": 1,
+                    "done_bytes": int(size or 0),
+                    "pending_bytes": -int(size or 0),
+                })
+            elif status == "skipped":
+                self._bump_locked(cur, task_id, {
+                    "skipped_items": 1,
+                    "pending_bytes": -int(size or 0),
+                })
             self._commit_deferred()
 
-    def mark_media_failed(self, task_id: str, chat_id: int, message_id: int, error: str) -> None:
+    def mark_media_failed(
+        self, task_id: str, chat_id: int, message_id: int, error: str,
+        *, size: Optional[int] = None,
+    ) -> None:
         with self.lock:
             cur = self.conn.cursor()
             cur.execute(
@@ -445,6 +532,12 @@ class Database:
                 """,
                 (error, utcnow(), task_id, chat_id, message_id),
             )
+            # Failed rows leave the "remaining" pool (callers always fail
+            # out of downloading/uploading, which were never subtracted).
+            self._bump_locked(cur, task_id, {
+                "failed_items": 1,
+                "pending_bytes": -int(size or 0),
+            })
             self._commit()
 
     def get_pending_media(self, task_id: str, limit: Optional[int] = None) -> list[dict]:
@@ -454,6 +547,32 @@ class Database:
             if limit:
                 query += f" LIMIT {int(limit)}"
             cur.execute(query, (task_id,))
+            rows = cur.fetchall()
+            return [self._row_to_dict(r, cur) for r in rows]
+
+    def get_pending_media_page(
+        self, task_id: str, after_message_id: int = 0, limit: int = 2000
+    ) -> list[dict]:
+        """One keyset page of the pending queue — the runner's feeder.
+
+        Selects ONLY the columns transfer_one() needs (chat_id,
+        message_id, file_name, file_size): ~4x less payload per row than
+        SELECT *, and keyset pagination (message_id > ?) stays O(page)
+        via idx_tm_task_msg no matter how deep the queue is (OFFSET
+        would rescan + resort on every page). Returns [] when exhausted.
+        """
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT chat_id, message_id, file_name, file_size
+                FROM task_media
+                WHERE task_id = ? AND status = 'pending' AND message_id > ?
+                ORDER BY message_id
+                LIMIT ?
+                """,
+                (task_id, int(after_message_id), int(limit)),
+            )
             rows = cur.fetchall()
             return [self._row_to_dict(r, cur) for r in rows]
 
@@ -504,6 +623,14 @@ class Database:
         return count
 
     def get_task_counts(self, task_id: str) -> dict[str, int]:
+        """Full reconcile of one task's counters from task_media.
+
+        This is the HEAVY query (full scan of the task's rows) — call it
+        only at boundaries: scan end, task end, retry, reset, startup
+        recovery. Hot paths maintain counters incrementally instead.
+        pending_bytes = bytes not yet done/failed/skipped (includes
+        in-flight downloading/uploading rows — the "Remaining" figure).
+        """
         with self.lock:
             cur = self.conn.cursor()
             cur.execute(
@@ -514,7 +641,8 @@ class Database:
             counts = {d.get("status"): d.get("n", 0) for d in [self._row_to_dict(r, cur) for r in rows]}
 
             cur.execute(
-                "SELECT COALESCE(SUM(file_size), 0) AS s FROM task_media WHERE task_id = ? AND status = 'pending'",
+                "SELECT COALESCE(SUM(file_size), 0) AS s FROM task_media "
+                "WHERE task_id = ? AND status IN ('pending', 'downloading', 'uploading')",
                 (task_id,),
             )
             row = cur.fetchone()
