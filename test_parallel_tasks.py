@@ -36,10 +36,16 @@ class MockClient:
     async def get_entity(self, ref):
         return SimpleNamespace(id=123456, title="Mock Chat", username=None)
 
-    async def iter_messages(self, source, offset_id=0):
+    async def iter_messages(self, source, offset_id=0, filter=None):
+        from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo
         for mid in sorted(self.messages.keys(), reverse=True):
             if offset_id == 0 or mid < offset_id:
-                yield self.messages[mid]
+                msg = self.messages[mid]
+                if isinstance(filter, InputMessagesFilterPhotos) and not getattr(msg, "photo", None):
+                    continue
+                if isinstance(filter, InputMessagesFilterVideo) and not getattr(msg, "video", None):
+                    continue
+                yield msg
 
     async def get_messages(self, source, ids):
         return self.messages.get(ids)

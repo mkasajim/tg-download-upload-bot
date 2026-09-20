@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 from telethon import TelegramClient, functions
 from telethon.errors import FloodWaitError
 from telethon.tl import types
+from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo
 
 from db import Database, utcnow
 
@@ -409,11 +410,18 @@ class TaskRunner:
                     **{cursor_col: cursor_val},
                 )
 
-        async def walk(start: int, stop: int, label: str, cursor_col: str) -> None:
+        async def walk_filter(start: int, stop: int, label: str, cursor_col: str, filter_: Any) -> None:
+            """Walk only photo/video messages (server-side filtered).
+
+            iter_messages with a media filter returns pages dense with actual
+            media instead of paging through every text message, so scanning a
+            chat full of text is orders of magnitude faster and needs far
+            fewer API requests (less FloodWait risk).
+            """
             offset = start
             while not self.stop_requested and not self.pause_requested:
                 try:
-                    async for msg in self.client.iter_messages(source, offset_id=offset):
+                    async for msg in self.client.iter_messages(source, offset_id=offset, filter=filter_):
                         if self.stop_requested or self.pause_requested:
                             break
                         if msg.id <= stop:
@@ -428,6 +436,15 @@ class TaskRunner:
                     flush(cursor_col, offset)
                     self.log("WARNING", f"FloodWait of {e.seconds}s during scan ({label}). Waiting...")
                     await asyncio.sleep(e.seconds + 1)
+
+        async def walk(start: int, stop: int, label: str, cursor_col: str) -> None:
+            # Photos and videos are filtered separately (the API has no
+            # combined photo+video filter); walking both concurrently keeps a
+            # request in flight at all times and roughly halves wall time.
+            await asyncio.gather(
+                walk_filter(start, stop, f"{label}/photos", cursor_col, InputMessagesFilterPhotos()),
+                walk_filter(start, stop, f"{label}/videos", cursor_col, InputMessagesFilterVideo()),
+            )
 
         # Full historical walk
         if not scan_complete:
@@ -471,7 +488,6 @@ class TaskRunner:
 
         size, name, kind = info
         fname = media_filename(name, kind, mid)
-        caption = (msg.raw_text or "")[:1024] or None
         errors = 0
 
         def begin(phase: str) -> None:
@@ -516,7 +532,6 @@ class TaskRunner:
                 sent = await self.client.send_file(
                     dest,
                     handle if handle is not None else str(path),
-                    caption=caption,
                     supports_streaming=(kind == "video"),
                 )
 

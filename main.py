@@ -41,6 +41,7 @@ except ImportError:
 from telethon import TelegramClient, functions
 from telethon.errors import FloodWaitError
 from telethon.tl import types
+from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo
 
 log = logging.getLogger("tg-transfer")
 
@@ -419,28 +420,37 @@ async def scan_source(client: TelegramClient, db: Database, cfg: Config, source:
         db.set_meta(key("last_seen"), str(state["last_seen"]))
 
     async def walk(start: int, stop: int, label: str, cursor_key: str) -> None:
-        """Walk messages with stop < id <= start, newest to oldest.
-        start=0 means from the newest message. Persists its cursor so an
-        interrupted walk resumes from where it got to."""
-        offset = start
-        while True:
-            try:
-                async for msg in client.iter_messages(source, offset_id=offset):
-                    if msg.id <= stop:
-                        return
-                    offer(msg)
-                    offset = msg.id
-                    if len(rows) >= SCAN_BATCH:
-                        flush()
-                        db.set_meta(key(cursor_key), str(offset))
-                db.set_meta(key(cursor_key), str(offset))
-                return
-            except FloodWaitError as e:
-                flush()
-                db.set_meta(key(cursor_key), str(offset))
-                log.warning("Scan (%s) hit a flood wait of %ds; resuming from #%s afterwards.",
-                            label, e.seconds, offset)
-                await asyncio.sleep(e.seconds + 1)
+        """Walk only photo/video messages (server-side filtered) with
+        stop < id <= start, newest to oldest. start=0 means from the newest
+        message. Media-only filtering returns pages dense with actual media
+        instead of paging through every text message, and the two filtered
+        walks run concurrently to roughly halve wall time."""
+
+        async def walk_filter(filter_: Any) -> None:
+            offset = start
+            while True:
+                try:
+                    async for msg in client.iter_messages(source, offset_id=offset, filter=filter_):
+                        if msg.id <= stop:
+                            return
+                        offer(msg)
+                        offset = msg.id
+                        if len(rows) >= SCAN_BATCH:
+                            flush()
+                            db.set_meta(key(cursor_key), str(offset))
+                    db.set_meta(key(cursor_key), str(offset))
+                    return
+                except FloodWaitError as e:
+                    flush()
+                    db.set_meta(key(cursor_key), str(offset))
+                    log.warning("Scan (%s) hit a flood wait of %ds; resuming from #%s afterwards.",
+                                label, e.seconds, offset)
+                    await asyncio.sleep(e.seconds + 1)
+
+        await asyncio.gather(
+            walk_filter(InputMessagesFilterPhotos()),
+            walk_filter(InputMessagesFilterVideo()),
+        )
 
     if db.get_meta(key("scan_complete")) != "1":
         cursor = int(db.get_meta(key("scan_cursor")) or 0)
@@ -626,7 +636,6 @@ async def transfer_one(ctx: Ctx, worker_id: int, row: sqlite3.Row) -> None:
 
     size, name, kind = info
     fname = media_filename(name, kind, mid)
-    caption = (msg.raw_text or "")[:1024] or None
     errors = 0
 
     def begin(phase: str) -> None:
@@ -663,7 +672,7 @@ async def transfer_one(ctx: Ctx, worker_id: int, row: sqlite3.Row) -> None:
                                            on_bytes("bytes_up"))
             sent = await ctx.client.send_file(
                 ctx.dest, handle if handle is not None else str(path),
-                caption=caption, supports_streaming=(kind == "video")
+                supports_streaming=(kind == "video")
             )
             log.info("%s #%d uploaded as dest message #%d in %.1fs",
                      tag, mid, sent.id, time.monotonic() - t0)

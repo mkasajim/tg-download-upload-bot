@@ -64,7 +64,8 @@ class FakeClient:
             self.msgs[msg.id] = msg
 
     # -- telethon interface --------------------------------------------------
-    def iter_messages(self, entity, offset_id: int = 0):
+    def iter_messages(self, entity, offset_id: int = 0, filter=None):
+        from telethon.tl.types import InputMessagesFilterPhotos, InputMessagesFilterVideo
         client = self
 
         async def gen():
@@ -72,11 +73,16 @@ class FakeClient:
             for mid in sorted(client.msgs, reverse=True):
                 if offset_id and mid >= offset_id:
                     continue
+                msg = client.msgs[mid]
+                if isinstance(filter, InputMessagesFilterPhotos) and not getattr(msg, "photo", None):
+                    continue
+                if isinstance(filter, InputMessagesFilterVideo) and not getattr(msg, "video", None):
+                    continue
                 n += 1
                 if mid in client.flood_after and n > client.flood_after[mid]:
                     client.flood_after.pop(mid)
                     raise FloodWaitError(None, capture=1)
-                yield client.msgs[mid]
+                yield msg
 
         return gen()
 
