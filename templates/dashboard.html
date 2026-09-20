@@ -236,6 +236,56 @@
         </div>
     </div>
 
+    <!-- Modal: Edit Task (workers / name / max size) -->
+    <div id="editTaskModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
+        <div class="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden">
+            <div class="p-6 border-b border-slate-800 flex items-center justify-between">
+                <div>
+                    <h3 class="text-lg font-bold text-white">Edit Task</h3>
+                    <p class="text-xs text-slate-400" id="editTaskSubtitle">Change worker count. Applies on resume — or live if running.</p>
+                </div>
+                <button onclick="closeEditModal()" class="text-slate-400 hover:text-white p-2">
+                    <i class="fa-solid fa-xmark text-lg"></i>
+                </button>
+            </div>
+
+            <form id="editTaskForm" onsubmit="saveEdit(event)" class="p-6 space-y-4">
+                <input type="hidden" id="editTaskId">
+                <div>
+                    <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1">Task Name</label>
+                    <input type="text" id="editTaskName"
+                           class="w-full px-3.5 py-2.5 bg-slate-800/90 border border-slate-700 rounded-xl text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm">
+                </div>
+
+                <div class="grid grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1">Parallel Workers</label>
+                        <input type="number" id="editTaskWorkers" min="1" max="16" required
+                               class="w-full px-3.5 py-2.5 bg-slate-800/90 border border-slate-700 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm">
+                        <p class="text-[11px] text-slate-500 mt-1" id="editWorkersHint">1–16 simultaneous files</p>
+                    </div>
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1">Max File Size (MB)</label>
+                        <input type="number" id="editTaskMaxSize" min="1" max="4000"
+                               class="w-full px-3.5 py-2.5 bg-slate-800/90 border border-slate-700 rounded-xl text-white focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm">
+                    </div>
+                </div>
+
+                <div class="pt-4 border-t border-slate-800 flex items-center justify-end gap-3">
+                    <button type="button" onclick="closeEditModal()"
+                            class="px-4 py-2.5 text-sm font-medium text-slate-400 hover:text-white rounded-xl">
+                        Cancel
+                    </button>
+                    <button type="submit" id="btnSaveEdit"
+                            class="px-5 py-2.5 bg-sky-600 hover:bg-sky-500 active:bg-sky-700 text-white text-sm font-semibold rounded-xl shadow-lg shadow-sky-600/20 transition flex items-center gap-2">
+                        <i class="fa-solid fa-floppy-disk text-xs"></i>
+                        <span>Save Changes</span>
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Modal: Search Groups & Channels -->
     <div id="searchModal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
         <div class="w-full max-w-3xl bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[85vh]">
@@ -346,6 +396,7 @@
         let currentTargetField = null;
         let currentDetailsTaskId = null;
         let currentDetailsTab = 'media';
+        let tasksById = {};
 
         function formatBytes(bytes) {
             if (!bytes || bytes === 0) return '0 B';
@@ -427,6 +478,8 @@
                     return;
                 }
                 const tasks = await res.json();
+                tasksById = {};
+                (tasks || []).forEach(t => { tasksById[t.id] = t; });
                 renderTasks(tasks);
             } catch (e) {
                 console.error('Tasks fetch error:', e);
@@ -512,6 +565,9 @@
                 }
 
                 actionButtons += `
+                    <button onclick="openEditModal('${task.id}')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition flex items-center gap-1.5" title="Edit workers / name / max size${(status === 'running' || status === 'scanning') ? ' (applies live)' : ' (applies on resume)'}">
+                        <i class="fa-solid fa-pen"></i> Edit
+                    </button>
                     <button onclick="openDetailsModal('${task.id}', '${escapeHtml(task.name)}')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold transition flex items-center gap-1.5">
                         <i class="fa-solid fa-list-check"></i> Media & Logs
                     </button>
@@ -721,6 +777,61 @@
             if (!confirm('Are you sure you want to delete this task?')) return;
             await fetch(`/api/tasks/${taskId}`, { method: 'DELETE' });
             fetchTasks();
+        }
+
+        // Edit Task Modal (pause & edit workers, or live-edit while running)
+        function openEditModal(taskId) {
+            const t = tasksById[taskId];
+            if (!t) return;
+            document.getElementById('editTaskId').value = taskId;
+            document.getElementById('editTaskName').value = t.name || '';
+            document.getElementById('editTaskWorkers').value = t.workers || 3;
+            document.getElementById('editTaskMaxSize').value = Math.round(((t.max_file_size || 2097152000) / 1024 / 1024));
+            const live = (t.status === 'running' || t.status === 'scanning');
+            document.getElementById('editTaskSubtitle').textContent = live
+                ? 'Task is running — worker change applies live (upscale spawns now, downscale finishes current files then shrinks).'
+                : 'Task is paused — worker change applies on resume.';
+            document.getElementById('editWorkersHint').textContent = live
+                ? 'Live: + spawns now, − shrinks gracefully'
+                : '1–16 simultaneous files (resume to apply)';
+            document.getElementById('editTaskModal').classList.remove('hidden');
+        }
+        function closeEditModal() {
+            document.getElementById('editTaskModal').classList.add('hidden');
+        }
+
+        async function saveEdit(e) {
+            e.preventDefault();
+            const taskId = document.getElementById('editTaskId').value;
+            const btn = document.getElementById('btnSaveEdit');
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Saving...';
+
+            const payload = {
+                name: document.getElementById('editTaskName').value.trim(),
+                workers: parseInt(document.getElementById('editTaskWorkers').value),
+                max_file_size: (parseInt(document.getElementById('editTaskMaxSize').value) || 2000) * 1024 * 1024
+            };
+
+            try {
+                const res = await fetch(`/api/tasks/${taskId}`, {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    closeEditModal();
+                    fetchTasks();
+                } else {
+                    alert('Error updating task: ' + (data.detail || 'Unknown error'));
+                }
+            } catch (err) {
+                alert('Connection error: ' + err.message);
+            } finally {
+                btn.disabled = false;
+                btn.innerHTML = '<i class="fa-solid fa-floppy-disk text-xs"></i> <span>Save Changes</span>';
+            }
         }
 
         // Details Modal (Media & Logs)

@@ -116,6 +116,83 @@ class TaskManager:
         self.invalidate_cache()
         return self.get_task_details(task_id)
 
+    async def update_task_config(
+        self,
+        task_id: str,
+        workers: Optional[int] = None,
+        name: Optional[str] = None,
+        max_file_size: Optional[int] = None,
+    ) -> dict:
+        """Edit a task's config from the dashboard.
+
+        - Paused/pending/stopped/completed/failed: persists to DB; the next
+          resume/start picks the new worker count up automatically (a fresh
+          TaskRunner reads tasks.workers on run()).
+        - Running/scanning (active runner): persists to DB AND scales live —
+          upscale spawns workers immediately, downscale lets in-flight
+          transfers finish their current file then exits the excess workers.
+          Remaining work stays queued in the shared queue/DB until an
+          active worker picks it up.
+        """
+        task = await asyncio.to_thread(self.db.get_task, task_id)
+        if not task:
+            raise ValueError(f"Task {task_id} not found")
+
+        updates: dict = {}
+        if workers is not None:
+            try:
+                w = int(workers)
+            except (TypeError, ValueError):
+                raise ValueError("workers must be an integer")
+            if not 1 <= w <= 16:
+                raise ValueError("workers must be between 1 and 16")
+            updates["workers"] = w
+        if name is not None:
+            cleaned = str(name).strip()
+            if not cleaned:
+                raise ValueError("name must not be empty")
+            updates["name"] = cleaned[:200]
+        if max_file_size is not None:
+            try:
+                mfs = int(max_file_size)
+            except (TypeError, ValueError):
+                raise ValueError("max_file_size must be an integer (bytes)")
+            if mfs < 1024 * 1024:
+                raise ValueError("max_file_size must be at least 1 MB")
+            updates["max_file_size"] = mfs
+
+        if not updates:
+            return await asyncio.to_thread(self.get_task_details, task_id)
+
+        old_workers = task.get("workers")
+        await asyncio.to_thread(self.db.update_task, task_id, **updates)
+        self.db.flush()
+
+        scale_info: Optional[dict] = None
+        runner = self.active_runners.get(task_id)
+        if runner is not None and "workers" in updates:
+            # Keep the in-memory copy in sync (scan phase reads it later)
+            # and scale live when the transfer phase is already active.
+            try:
+                scale_info = runner.scale_workers(updates["workers"])
+            except Exception as e:
+                log.warning("Task %s live scale failed: %s", task_id[:8], e)
+
+        if "workers" in updates:
+            self.db.add_log(
+                task_id, "INFO",
+                f"Workers changed {old_workers} -> {updates['workers']}"
+                + (" (live scaling applied)" if scale_info and scale_info.get("spawned", 0) >= 0 and runner else " (applies on resume)"),
+            )
+        if "name" in updates:
+            self.db.add_log(task_id, "INFO", f"Task renamed to {updates['name']!r}.")
+        self.db.flush()
+        self.invalidate_cache()
+        details = await asyncio.to_thread(self.get_task_details, task_id)
+        if scale_info is not None:
+            details["scale"] = scale_info
+        return details
+
     async def delete_task(self, task_id: str) -> bool:
         runner = self.active_runners.get(task_id)
         if runner:

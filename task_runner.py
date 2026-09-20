@@ -239,6 +239,18 @@ class TaskRunner:
         self.active_workers: list[asyncio.Task] = []
         self.feeder_task: Optional[asyncio.Task] = None
         self.worker_progress: dict[int, dict] = {}
+        # Live worker scaling: target_workers is the desired concurrency.
+        # worker_loop() checks `worker_id > target_workers` before pulling
+        # the next queue item, so a downscale lets in-flight transfers
+        # finish their current file then exit (no wasted bandwidth, no
+        # mid-file cancel). An upscale spawns fresh workers immediately.
+        # Pending items simply wait in the shared queue/DB — that IS the
+        # "queued" state, no extra paused-worker bookkeeping needed.
+        self.target_workers: int = int(self.task_info.get("workers") or 3)
+        self._next_worker_id: int = self.target_workers + 1
+        self._queue: Optional[asyncio.Queue] = None
+        self._source: Any = None
+        self._dest: Any = None
         self.stats = {
             "bytes_down": 0,
             "bytes_up": 0,
@@ -597,6 +609,11 @@ class TaskRunner:
 
     async def worker_loop(self, worker_id: int, queue: asyncio.Queue, source: Any, dest: Any) -> None:
         while not self.stop_requested and not self.pause_requested:
+            # Graceful downscale checkpoint: excess workers exit instead of
+            # pulling the next item. In-flight work is never cancelled here —
+            # the current transfer_one() already finished before we loop back.
+            if worker_id > self.target_workers:
+                break
             try:
                 row = await queue.get()
                 if row is None:
@@ -613,6 +630,44 @@ class TaskRunner:
                     queue.task_done()
             except asyncio.CancelledError:
                 break
+
+    def live_worker_count(self) -> int:
+        """Number of worker asyncio tasks not yet finished."""
+        return sum(1 for w in self.active_workers if not w.done())
+
+    def scale_workers(self, new_count: int) -> dict:
+        """Change desired concurrency live (called from TaskManager while
+        the task is running) or pre-transfer (scan phase / paused edit).
+
+        - Upscale: spawn fresh worker_loop tasks immediately; they share
+          the same queue so pending items are picked up at once.
+        - Downscale: just lower target_workers — excess workers finish
+          their current file then exit via the checkpoint in worker_loop.
+          No mid-file cancel, no wasted bandwidth. Pending work stays
+          queued in DB/shared queue until an active worker takes it.
+        """
+        new_count = max(1, min(16, int(new_count)))
+        old = int(self.target_workers)
+        self.target_workers = new_count
+        self.task_info["workers"] = new_count
+        spawned = 0
+        # Only spawn when the transfer phase is active (queue/source bound).
+        if self._queue is not None and self._source is not None and self._dest is not None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and new_count > old:
+                live = self.live_worker_count()
+                for _ in range(new_count - live):
+                    wid = self._next_worker_id
+                    self._next_worker_id += 1
+                    self.active_workers.append(
+                        loop.create_task(self.worker_loop(wid, self._queue, self._source, self._dest))
+                    )
+                    spawned += 1
+        return {"old_workers": old, "new_workers": new_count, "spawned": spawned,
+                "live_workers": self.live_worker_count()}
 
     def sweep_dir(self) -> int:
         n = 0
@@ -714,7 +769,15 @@ class TaskRunner:
                 finally:
                     feed_done.set()
 
-            workers_count = int(self.task_info.get("workers") or 3)
+            workers_count = max(1, min(16, int(self.task_info.get("workers") or 3)))
+            # Re-sync scaling state in case this runner object is reused
+            # (normally a fresh runner is created per resume, but keep it exact).
+            self.target_workers = workers_count
+            self.task_info["workers"] = workers_count
+            self._next_worker_id = workers_count + 1
+            self._queue = queue
+            self._source = source
+            self._dest = dest
             self.feeder_task = asyncio.create_task(feeder())
             self.active_workers = [
                 asyncio.create_task(self.worker_loop(i + 1, queue, source, dest))
@@ -746,6 +809,9 @@ class TaskRunner:
                     self.feeder_task.cancel()
                     await asyncio.gather(self.feeder_task, return_exceptions=True)
                 self.feeder_task = None
+                self._queue = None
+                self._source = None
+                self._dest = None
 
             if queued["n"] == 0:
                 self.log("INFO", "No pending items to transfer. Task marked completed.")

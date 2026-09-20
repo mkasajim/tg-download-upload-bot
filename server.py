@@ -54,6 +54,12 @@ class CreateTaskRequest(BaseModel):
     max_file_size: int = 2097152000
 
 
+class UpdateTaskRequest(BaseModel):
+    workers: Optional[int] = None
+    name: Optional[str] = None
+    max_file_size: Optional[int] = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_instance, client_instance, manager_instance, tunnel_instance, me_info
@@ -264,6 +270,24 @@ async def api_resume_task(task_id: str, admin: str = Depends(auth.get_current_ad
     if not manager_instance:
         raise HTTPException(status_code=500, detail="TaskManager not ready")
     return await manager_instance.resume_task(task_id)
+
+
+@app.patch("/api/tasks/{task_id}")
+async def api_update_task(task_id: str, req: UpdateTaskRequest, admin: str = Depends(auth.get_current_admin)):
+    if not manager_instance:
+        raise HTTPException(status_code=500, detail="TaskManager not ready")
+    try:
+        return await manager_instance.update_task_config(
+            task_id,
+            workers=req.workers,
+            name=req.name,
+            max_file_size=req.max_file_size,
+        )
+    except ValueError as e:
+        msg = str(e)
+        if "not found" in msg.lower():
+            raise HTTPException(status_code=404, detail=msg)
+        raise HTTPException(status_code=400, detail=msg)
 
 
 @app.post("/api/tasks/{task_id}/stop")
