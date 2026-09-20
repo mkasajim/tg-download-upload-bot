@@ -246,6 +246,7 @@ class TaskRunner:
         }
         self.download_dir = (BASE_DIR / os.environ.get("DOWNLOAD_DIR", "downloads")) / f"task_{self.task_id}"
         self._last_metrics_sync = time.monotonic()
+        self._terminal_status: Optional[str] = None
 
     def _log_sync(self, level: str, msg: str) -> None:
         log.log(getattr(logging, level.upper(), logging.INFO), "[Task %s] %s", self.task_id[:8], msg)
@@ -611,6 +612,35 @@ class TaskRunner:
                 pass
         return n
 
+    async def _set_status(self, status: str, **kwargs) -> None:
+        """Thread-safe status update that also records terminal states."""
+        if status in ("completed", "paused", "stopped", "failed"):
+            self._terminal_status = status
+        await asyncio.to_thread(self.db.update_task_status, self.task_id, status, **kwargs)
+
+    async def _reconcile_status(self) -> None:
+        """If the runner exited but the DB still shows a transient status
+        (scanning/running) and no terminal status was recorded this run,
+        correct it so the dashboard reflects reality (no phantom scans)."""
+        try:
+            task = await asyncio.to_thread(self.db.get_task, self.task_id)
+            if not task:
+                return
+            current = task.get("status")
+            if current in ("scanning", "running") and self._terminal_status is None:
+                if self.stop_requested:
+                    new = "stopped"
+                else:
+                    new = "paused"
+                log.warning(
+                    "[Task %s] reconciling stale status '%s' -> '%s' on runner exit",
+                    self.task_id[:8], current, new,
+                )
+                self._terminal_status = new
+                await asyncio.to_thread(self.db.update_task_status, self.task_id, new)
+        except Exception as e:
+            log.warning("[Task %s] status reconcile failed: %s", self.task_id[:8], e)
+
     async def run(self) -> None:
         self.stop_requested = False
         self.pause_requested = False
@@ -638,7 +668,7 @@ class TaskRunner:
 
             if not pending_rows:
                 self.log("INFO", "No pending items to transfer. Task marked completed.")
-                await asyncio.to_thread(self.db.update_task_status, self.task_id, "completed")
+                await self._set_status("completed")
                 return
 
             queue: asyncio.Queue = asyncio.Queue()
@@ -669,10 +699,10 @@ class TaskRunner:
 
             counts = await asyncio.to_thread(self.db.get_task_counts, self.task_id)
             if counts["pending"] == 0:
-                await asyncio.to_thread(self.db.update_task_status, self.task_id, "completed")
+                await self._set_status("completed")
                 self.log("INFO", f"Task finished: {counts['done']} done, {counts['failed']} failed.")
             else:
-                await asyncio.to_thread(self.db.update_task_status, self.task_id, "paused")
+                await self._set_status("paused")
 
         except asyncio.CancelledError:
             self.log("INFO", "Task was cancelled/interrupted.")
@@ -681,17 +711,18 @@ class TaskRunner:
             raise
         except Exception as e:
             self.log("ERROR", f"Task fatal error: {type(e).__name__}: {e}")
-            await asyncio.to_thread(self.db.update_task_status, self.task_id, "failed", error_message=str(e))
+            await self._set_status("failed", error_message=str(e))
             self.sweep_dir()
             await asyncio.to_thread(self.db.reset_incomplete_media, self.task_id)
         finally:
             self.worker_progress.clear()
             await self._sync_metrics(force=True)
+            await self._reconcile_status()
             await asyncio.to_thread(self.db.flush)
 
     async def pause(self) -> None:
         self.pause_requested = True
-        await asyncio.to_thread(self.db.update_task_status, self.task_id, "paused")
+        await self._set_status("paused")
         await asyncio.to_thread(self.db.flush)
         self.log("INFO", "Task pause requested.")
         for w in self.active_workers:
@@ -699,7 +730,7 @@ class TaskRunner:
 
     async def stop(self) -> None:
         self.stop_requested = True
-        await asyncio.to_thread(self.db.update_task_status, self.task_id, "stopped")
+        await self._set_status("stopped")
         await asyncio.to_thread(self.db.flush)
         self.log("INFO", "Task stop requested.")
         for w in self.active_workers:
