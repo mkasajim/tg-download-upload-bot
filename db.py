@@ -15,6 +15,8 @@ import logging
 import os
 import sqlite3
 import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -44,6 +46,14 @@ class Database:
         self.db_path = Path(db_path or os.environ.get("DB_PATH", "progress.db"))
         self.is_remote = False
         self.conn = None
+
+        # Deferred-commit machinery: hot paths (worker status updates, scan
+        # flushes) would otherwise trigger a commit (and, for a remote
+        # LibSQL/Turso DB, a network round-trip) on every single write.
+        self.commit_interval = float(os.environ.get("DB_COMMIT_INTERVAL", "1.0"))
+        self._last_commit = time.monotonic()
+        self._dirty = False
+        self._batch_depth = 0
 
         self._connect()
         self._init_schema()
@@ -167,10 +177,50 @@ class Database:
             self._commit()
 
     def _commit(self) -> None:
+        """Commit with lock held; respects batching."""
+        if self._batch_depth > 0:
+            self._dirty = True
+            return
         try:
             self.conn.commit()
+            self._last_commit = time.monotonic()
+            self._dirty = False
         except Exception:
             pass
+
+    def _commit_deferred(self) -> None:
+        """Commit at most every `commit_interval` seconds (for hot write paths).
+
+        A background-ish explicit `flush()` (called by runners on pause/stop
+        and by the server on shutdown) guarantees durability within at most
+        `commit_interval` seconds even if writes keep arriving.
+        """
+        if self._batch_depth > 0:
+            self._dirty = True
+            return
+        if (time.monotonic() - self._last_commit) >= self.commit_interval:
+            self._commit()
+        else:
+            self._dirty = True
+
+    def flush(self) -> None:
+        """Force-commit any pending writes. Safe to call anytime."""
+        with self.lock:
+            self._commit()
+
+    @contextmanager
+    def batch(self):
+        """Group multiple writes into a single transaction (one commit)."""
+        with self.lock:
+            self._batch_depth += 1
+        try:
+            yield self
+        finally:
+            with self.lock:
+                self._batch_depth -= 1
+                if self._batch_depth <= 0:
+                    self._batch_depth = 0
+                    self._commit()
 
     def _row_to_dict(self, row: Any, cur: Any) -> dict:
         if isinstance(row, dict):
@@ -266,6 +316,44 @@ class Database:
             rows = cur.fetchall()
             return [self._row_to_dict(r, cur) for r in rows]
 
+    def list_tasks_with_counts(self) -> list[dict]:
+        """All tasks plus live media counts in a single aggregate query.
+
+        Replaces the previous N+1 pattern (list_tasks + get_task per task +
+        get_task_counts per task) that serialized on the DB lock for every
+        dashboard poll.
+        """
+        with self.lock:
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT
+                    t.*,
+                    COALESCE(c.total_items, 0)   AS total_items,
+                    COALESCE(c.done_items, 0)    AS done_items,
+                    COALESCE(c.failed_items, 0)  AS failed_items,
+                    COALESCE(c.skipped_items, 0) AS skipped_items,
+                    COALESCE(c.pending_bytes, 0) AS pending_bytes,
+                    COALESCE(c.done_bytes, 0)    AS done_bytes
+                FROM tasks t
+                LEFT JOIN (
+                    SELECT
+                        task_id,
+                        COUNT(*) AS total_items,
+                        SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) AS done_items,
+                        SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_items,
+                        SUM(CASE WHEN status = 'skipped' THEN 1 ELSE 0 END) AS skipped_items,
+                        SUM(CASE WHEN status = 'pending' THEN COALESCE(file_size, 0) ELSE 0 END) AS pending_bytes,
+                        SUM(CASE WHEN status = 'done' THEN COALESCE(file_size, 0) ELSE 0 END) AS done_bytes
+                    FROM task_media
+                    GROUP BY task_id
+                ) c ON c.task_id = t.id
+                ORDER BY t.created_at DESC
+                """
+            )
+            rows = cur.fetchall()
+            return [self._row_to_dict(r, cur) for r in rows]
+
     def update_task(self, task_id: str, **kwargs) -> None:
         if not kwargs:
             return
@@ -275,7 +363,7 @@ class Database:
         with self.lock:
             cur = self.conn.cursor()
             cur.execute(f"UPDATE tasks SET {', '.join(cols)} WHERE id = ?", vals)
-            self._commit()
+            self._commit_deferred()
 
     def update_task_status(self, task_id: str, status: str, error_message: Optional[str] = None) -> None:
         self.update_task(task_id, status=status, error_message=error_message)
@@ -313,8 +401,9 @@ class Database:
                 payload,
             )
             count = cur.rowcount if hasattr(cur, "rowcount") and cur.rowcount > 0 else len(rows)
-            self._commit()
-        self.sync_task_metrics(task_id)
+            self._commit_deferred()
+        # NOTE: sync_task_metrics is intentionally NOT called per insert.
+        # Scans flush hundreds of batches; callers sync once at the end.
         return count
 
     def set_media_status(
@@ -340,7 +429,7 @@ class Database:
                 """,
                 (status, dest_message_id, error, utcnow(), task_id, chat_id, message_id),
             )
-            self._commit()
+            self._commit_deferred()
 
     def mark_media_failed(self, task_id: str, chat_id: int, message_id: int, error: str) -> None:
         with self.lock:
@@ -506,7 +595,7 @@ class Database:
                 "INSERT INTO task_logs (task_id, level, message, timestamp) VALUES (?, ?, ?, ?)",
                 (task_id, level, message, utcnow()),
             )
-            self._commit()
+            self._commit_deferred()
 
     def get_logs(self, task_id: str, limit: int = 100) -> list[dict]:
         with self.lock:

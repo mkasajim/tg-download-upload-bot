@@ -21,6 +21,7 @@ import argparse
 import asyncio
 import os
 import sys
+import time
 import unicodedata
 from pathlib import Path
 
@@ -132,9 +133,26 @@ def print_results(rows: list[tuple[str, str, int, str]], source_hint: str = "") 
         print(source_hint)
 
 
+# Cache for the full dialog list. `get_dialogs(limit=None)` downloads every
+# dialog over the network; the dashboard search used to do this on every
+# keystroke, freezing the event loop for seconds. Cache it briefly instead.
+_DIALOG_CACHE_TTL = float(os.environ.get("DIALOG_CACHE_TTL", "60"))
+_dialog_cache: dict = {"ts": 0.0, "data": None}
+
+
+async def _get_dialogs_cached(client: TelegramClient):
+    now = time.monotonic()
+    if _dialog_cache["data"] is not None and (now - _dialog_cache["ts"]) < _DIALOG_CACHE_TTL:
+        return _dialog_cache["data"]
+    data = await client.get_dialogs(limit=None)
+    _dialog_cache["data"] = data
+    _dialog_cache["ts"] = now
+    return data
+
+
 async def local_search(client: TelegramClient, query_raw: str):
     query_norm = normalize(query_raw)
-    dialogs = await client.get_dialogs(limit=None)
+    dialogs = await _get_dialogs_cached(client)
     out = []
     scanned = 0
     for d in dialogs:

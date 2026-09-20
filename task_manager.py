@@ -48,12 +48,12 @@ class TaskManager:
         return recovered
 
     async def start_task(self, task_id: str) -> dict:
-        task = self.db.get_task(task_id)
+        task = await asyncio.to_thread(self.db.get_task, task_id)
         if not task:
             raise ValueError(f"Task {task_id} not found")
 
         if task_id in self.active_runners:
-            return self.get_task_details(task_id)
+            return await asyncio.to_thread(self.get_task_details, task_id)
 
         runner = TaskRunner(task_id, self.db, self.client)
         self.active_runners[task_id] = runner
@@ -66,15 +66,16 @@ class TaskManager:
                 self.async_tasks.pop(task_id, None)
 
         self.async_tasks[task_id] = asyncio.create_task(_run())
-        return self.get_task_details(task_id)
+        return await asyncio.to_thread(self.get_task_details, task_id)
 
     async def pause_task(self, task_id: str) -> dict:
         runner = self.active_runners.get(task_id)
         if runner:
             await runner.pause()
         else:
-            self.db.update_task_status(task_id, "paused")
-        return self.get_task_details(task_id)
+            await asyncio.to_thread(self.db.update_task_status, task_id, "paused")
+            self.db.flush()
+        return await asyncio.to_thread(self.get_task_details, task_id)
 
     async def resume_task(self, task_id: str) -> dict:
         return await self.start_task(task_id)
@@ -84,8 +85,9 @@ class TaskManager:
         if runner:
             await runner.stop()
         else:
-            self.db.update_task_status(task_id, "stopped")
-        return self.get_task_details(task_id)
+            await asyncio.to_thread(self.db.update_task_status, task_id, "stopped")
+            self.db.flush()
+        return await asyncio.to_thread(self.get_task_details, task_id)
 
     def retry_failed(self, task_id: str) -> dict:
         requeued = self.db.retry_failed_media(task_id)
@@ -138,12 +140,30 @@ class TaskManager:
         return task
 
     def list_all_tasks(self) -> list[dict]:
-        tasks = self.db.list_tasks()
+        # Single aggregate query for all tasks + counts (was N+1 per task).
+        tasks = self.db.list_tasks_with_counts()
         res = []
         for t in tasks:
-            details = self.get_task_details(t["id"])
-            if details:
-                res.append(details)
+            task = dict(t)
+            runner = self.active_runners.get(task["id"])
+            if runner:
+                live = runner.get_status()
+                task["live"] = live
+                task["is_active"] = True
+                task["down_speed"] = live["down_speed"]
+                task["up_speed"] = live["up_speed"]
+                task["workers_active"] = live["workers"]
+            else:
+                task["live"] = None
+                task["is_active"] = False
+                task["down_speed"] = 0
+                task["up_speed"] = 0
+                task["workers_active"] = []
+
+            total = task.get("total_items") or 0
+            done = task.get("done_items") or 0
+            task["percent"] = round((done / total) * 100, 1) if total > 0 else 0.0
+            res.append(task)
         return res
 
     def get_global_stats(self) -> dict:

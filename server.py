@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import env_loader  # Must be first to load .env into os.environ
 
+import asyncio
 import logging
 import os
 import uuid
@@ -108,6 +109,11 @@ async def lifespan(app: FastAPI):
     log.info("Shutting down server...")
     if tunnel_instance:
         tunnel_instance.stop()
+    if db_instance:
+        try:
+            await asyncio.to_thread(db_instance.flush)
+        except Exception:
+            pass
     if client_instance and client_instance.is_connected():
         await client_instance.disconnect()
 
@@ -166,7 +172,7 @@ async def api_logout(response: Response):
 
 @app.get("/api/status")
 async def api_status(admin: str = Depends(auth.get_current_admin)):
-    stats = manager_instance.get_global_stats() if manager_instance else {}
+    stats = await asyncio.to_thread(manager_instance.get_global_stats) if manager_instance else {}
     tunnel_status = tunnel_instance.get_status() if tunnel_instance else {"enabled": False}
 
     return {
@@ -211,9 +217,9 @@ async def api_search_public(q: str = "", limit: int = 20, admin: str = Depends(a
 @app.get("/api/tasks")
 async def api_list_tasks(admin: str = Depends(auth.get_current_admin)):
     if manager_instance:
-        return manager_instance.list_all_tasks()
+        return await asyncio.to_thread(manager_instance.list_all_tasks)
     if db_instance:
-        return db_instance.list_tasks()
+        return await asyncio.to_thread(db_instance.list_tasks)
     return []
 
 
@@ -223,7 +229,8 @@ async def api_create_task(req: CreateTaskRequest, admin: str = Depends(auth.get_
         raise HTTPException(status_code=500, detail="Database not initialized")
 
     task_id = f"task_{uuid.uuid4().hex[:8]}"
-    task = db_instance.create_task(
+    task = await asyncio.to_thread(
+        db_instance.create_task,
         task_id=task_id,
         name=req.name,
         source_peer=req.source,
@@ -269,10 +276,10 @@ async def api_stop_task(task_id: str, admin: str = Depends(auth.get_current_admi
 @app.post("/api/tasks/{task_id}/retry-failed")
 async def api_retry_failed(task_id: str, admin: str = Depends(auth.get_current_admin)):
     if manager_instance:
-        return manager_instance.retry_failed(task_id)
+        return await asyncio.to_thread(manager_instance.retry_failed, task_id)
     if db_instance:
-        db_instance.retry_failed_media(task_id)
-        return db_instance.get_task(task_id) or {}
+        await asyncio.to_thread(db_instance.retry_failed_media, task_id)
+        return await asyncio.to_thread(db_instance.get_task, task_id) or {}
     raise HTTPException(status_code=500, detail="Database not ready")
 
 
@@ -282,7 +289,7 @@ async def api_delete_task(task_id: str, admin: str = Depends(auth.get_current_ad
         ok = await manager_instance.delete_task(task_id)
         return {"status": "ok" if ok else "not_found"}
     if db_instance:
-        ok = db_instance.delete_task(task_id)
+        ok = await asyncio.to_thread(db_instance.delete_task, task_id)
         return {"status": "ok" if ok else "not_found"}
     raise HTTPException(status_code=500, detail="Database not ready")
 
@@ -297,7 +304,7 @@ async def api_task_media(
 ):
     if not db_instance:
         return []
-    return db_instance.list_media(task_id, status=status, offset=offset, limit=limit)
+    return await asyncio.to_thread(db_instance.list_media, task_id, status=status, offset=offset, limit=limit)
 
 
 @app.get("/api/tasks/{task_id}/logs")
@@ -308,7 +315,7 @@ async def api_task_logs(
 ):
     if not db_instance:
         return []
-    return db_instance.get_logs(task_id, limit=limit)
+    return await asyncio.to_thread(db_instance.get_logs, task_id, limit=limit)
 
 
 # ---------------------------------------------------------------------------

@@ -36,7 +36,8 @@ BASE_DIR = Path(__file__).resolve().parent
 CHUNK_SIZE = 512 * 1024
 MIN_PARALLEL_DOWNLOAD = 4 * 1024 * 1024
 BIG_FILE_UPLOAD = 10 * 1024 * 1024
-SCAN_BATCH = 200
+SCAN_BATCH = 1000  # larger batches => far fewer commits/round-trips on remote DBs
+METRICS_SYNC_INTERVAL = 5.0  # seconds between task_media metric syncs (was per-file)
 
 BINARY = getattr(os, "O_BINARY", 0)
 
@@ -243,6 +244,19 @@ class TaskRunner:
             "t0": time.monotonic(),
         }
         self.download_dir = (BASE_DIR / os.environ.get("DOWNLOAD_DIR", "downloads")) / f"task_{self.task_id}"
+        self._last_metrics_sync = time.monotonic()
+
+    def _sync_metrics(self, force: bool = False) -> None:
+        """Aggregate task_media counters into the tasks row, throttled.
+
+        Previously this ran 3 aggregate SELECTs + 1 UPDATE on *every* file,
+        which dominated the DB lock. Now it runs at most every
+        METRICS_SYNC_INTERVAL seconds (or when forced).
+        """
+        now = time.monotonic()
+        if force or (now - self._last_metrics_sync) >= METRICS_SYNC_INTERVAL:
+            self._last_metrics_sync = now
+            self.db.sync_task_metrics(self.task_id)
 
     def log(self, level: str, msg: str) -> None:
         log.log(getattr(logging, level.upper(), logging.INFO), "[Task %s] %s", self.task_id[:8], msg)
@@ -348,7 +362,7 @@ class TaskRunner:
         self.db.update_task_status(self.task_id, "scanning")
         self.log("INFO", f"Starting media scan on source {chat_id}...")
 
-        task_data = self.db.get_task(self.task_id) or {}
+        task_data = self.task_info  # already loaded in __init__; avoids a DB round-trip
         max_size = int(task_data.get("max_file_size") or 2097152000)
         last_seen = int(task_data.get("last_seen") or 0)
         scan_cursor = int(task_data.get("scan_cursor") or 0)
@@ -383,14 +397,17 @@ class TaskRunner:
 
         def flush(cursor_col: str, cursor_val: int) -> None:
             nonlocal added
-            if rows:
-                added += self.db.insert_media(self.task_id, rows)
-                rows.clear()
-            self.db.update_task(
-                self.task_id,
-                last_seen=last_seen,
-                **{cursor_col: cursor_val},
-            )
+            # Single transaction: batch insert + cursor update = 1 commit
+            # instead of 2 (and 1 network round-trip on remote DBs).
+            with self.db.batch():
+                if rows:
+                    added += self.db.insert_media(self.task_id, rows)
+                    rows.clear()
+                self.db.update_task(
+                    self.task_id,
+                    last_seen=last_seen,
+                    **{cursor_col: cursor_val},
+                )
 
         async def walk(start: int, stop: int, label: str, cursor_col: str) -> None:
             offset = start
@@ -507,7 +524,7 @@ class TaskRunner:
                 self.worker_progress.pop(worker_id, None)
                 shutil.rmtree(job_dir, ignore_errors=True)
                 self.stats["done_this_run"] += 1
-                self.db.sync_task_metrics(self.task_id)
+                self._sync_metrics()
                 return
 
             except FloodWaitError as e:
@@ -516,7 +533,7 @@ class TaskRunner:
                     shutil.rmtree(job_dir, ignore_errors=True)
                     self.stats["failed_this_run"] += 1
                     self.worker_progress.pop(worker_id, None)
-                    self.db.sync_task_metrics(self.task_id)
+                    self._sync_metrics()
                     return
                 self.log("WARNING", f"Worker #{worker_id} hit FloodWait of {e.seconds}s. Waiting...")
                 await asyncio.sleep(e.seconds + 1)
@@ -532,7 +549,7 @@ class TaskRunner:
                     self.db.mark_media_failed(self.task_id, chat_id, mid, f"{type(e).__name__}: {e}")
                     self.stats["failed_this_run"] += 1
                     self.worker_progress.pop(worker_id, None)
-                    self.db.sync_task_metrics(self.task_id)
+                    self._sync_metrics()
                     return
                 await asyncio.sleep(min(2 ** errors, 30))
 
@@ -646,10 +663,13 @@ class TaskRunner:
             self.db.reset_incomplete_media(self.task_id)
         finally:
             self.worker_progress.clear()
+            self._sync_metrics(force=True)
+            self.db.flush()
 
     async def pause(self) -> None:
         self.pause_requested = True
         self.db.update_task_status(self.task_id, "paused")
+        self.db.flush()
         self.log("INFO", "Task pause requested.")
         for w in self.active_workers:
             w.cancel()
@@ -657,6 +677,7 @@ class TaskRunner:
     async def stop(self) -> None:
         self.stop_requested = True
         self.db.update_task_status(self.task_id, "stopped")
+        self.db.flush()
         self.log("INFO", "Task stop requested.")
         for w in self.active_workers:
             w.cancel()

@@ -828,7 +828,7 @@
             window.location.href = '/login';
         }
 
-        // Initialize and poll every 2 seconds
+        // Initialize and poll every 3 seconds
         fetchStatus();
         fetchTasks();
         setInterval(() => {
@@ -838,7 +838,7 @@
                 if (currentDetailsTab === 'media') loadDetailsMedia();
                 if (currentDetailsTab === 'logs') loadDetailsLogs();
             }
-        }, 2000);
+        }, 3000);
     </script>
 </body>
 </html>
