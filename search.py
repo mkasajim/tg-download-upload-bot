@@ -176,6 +176,36 @@ async def global_search(client: TelegramClient, query_raw: str, limit: int = 20)
     return out
 
 
+async def search_dialogs_structured(client: TelegramClient, query: str = "") -> list[dict]:
+    rows, scanned, total = await local_search(client, query)
+    res = []
+    for title, username, full_id, kind in rows:
+        usable = username if username != "-" else str(full_id)
+        res.append({
+            "title": title,
+            "username": username,
+            "id": full_id,
+            "type": kind,
+            "usable": usable
+        })
+    return res
+
+
+async def search_public_structured(client: TelegramClient, query: str = "", limit: int = 20) -> list[dict]:
+    rows = await global_search(client, query, limit=limit)
+    res = []
+    for title, username, full_id, kind in rows:
+        usable = username if username != "-" else str(full_id)
+        res.append({
+            "title": title,
+            "username": username,
+            "id": full_id,
+            "type": kind,
+            "usable": usable
+        })
+    return res
+
+
 async def run_query(client: TelegramClient, query_raw: str, global_limit: int, no_global: bool) -> None:
     local, scanned_groups, total_dialogs = await local_search(client, query_raw)
     print(f"\nMy chats: {len(local)} match(es) "

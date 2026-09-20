@@ -15,6 +15,8 @@ Config:   see .env.example / README.md
 
 from __future__ import annotations
 
+import env_loader  # Ensures .env is loaded
+
 import argparse
 import asyncio
 import json
@@ -827,29 +829,40 @@ async def main_async(cfg: Config, args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    env_loader.load_env()
     parser = argparse.ArgumentParser(
-        description="Download videos and photos from a Telegram chat you joined "
-                    "and re-upload them to your own private group, resumably."
+        description="Telegram media transfer bot & dashboard server."
     )
+    parser.add_argument("--server", action="store_true", default=False,
+                        help="launch the web dashboard and Cloudflare tunnel server (default)")
+    parser.add_argument("--cli", action="store_true", default=False,
+                        help="run single transfer job directly in CLI mode")
     parser.add_argument("--workers", type=int, metavar="N",
                         help="number of parallel workers (overrides WORKERS in .env)")
     parser.add_argument("--dry-run", action="store_true",
-                        help="scan only and show what would be transferred")
+                        help="scan only and show what would be transferred (CLI mode)")
     parser.add_argument("--retry-failed", action="store_true",
                         help="re-queue items previously marked failed")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s %(levelname)-7s %(message)s",
-                        datefmt="%H:%M:%S")
-    logging.getLogger("telethon").setLevel(logging.WARNING)
+    # If --cli or --dry-run is specified, run in CLI mode. Otherwise default to Dashboard Server.
+    if args.cli or args.dry_run:
+        logging.basicConfig(level=logging.INFO,
+                            format="%(asctime)s %(levelname)-7s %(message)s",
+                            datefmt="%H:%M:%S")
+        logging.getLogger("telethon").setLevel(logging.WARNING)
 
-    cfg = build_config(args)
-    try:
-        asyncio.run(main_async(cfg, args))
-    except KeyboardInterrupt:
-        print("\nInterrupted - progress is saved. Run the script again to resume.")
-        return 130
+        cfg = build_config(args)
+        try:
+            asyncio.run(main_async(cfg, args))
+        except KeyboardInterrupt:
+            print("\nInterrupted - progress is saved. Run the script again to resume.")
+            return 130
+        return 0
+
+    # Default to web dashboard server
+    import server
+    server.run_server()
     return 0
 
 

@@ -14,3 +14,4 @@ downloads/
 *.db-wal
 *.db-shm
 *.zip
+*.pid

@@ -60,13 +60,54 @@ group you own**, then deletes each local file to keep disk usage near zero.
 Interrupted runs: items stuck mid-transfer are reset to `pending` and leftover
 partial files are swept automatically on the next start.
 
-## Usage
+## Web Dashboard & Admin Control Center
 
-```
-python main.py                 # normal run (scan + transfer everything pending)
-python main.py --dry-run       # scan only, show what would be transferred
-python main.py --workers 5     # override WORKERS from .env
-python main.py --retry-failed  # re-queue videos previously marked failed
+The bot features a web dashboard with secure admin login:
+
+- **Full Bot Control**: Search Telegram dialogs and public channels, select sources and destinations with one click, and create mirroring tasks.
+- **Parallel Multi-Task Engine**: Run multiple transfer jobs simultaneously. Each task has independent workers and can be paused, resumed, stopped, or deleted individually.
+- **Remote LibSQL (Turso Cloud) Database**: Progress and tasks are synchronized to Turso (`libsql://...`), so if a VPS dies or shuts down abruptly, another VPS can connect to the same remote DB and seamlessly resume transfers right where they stopped without data loss or re-downloading completed files.
+- **Automated Cloudflare Tunnel (`cloudflared`)**: Serves the dashboard over a custom domain/subdomain with automated stale tunnel cleanup.
+
+### Dashboard Quickstart
+
+1. Fill in `.env`:
+   ```bash
+   API_ID=...
+   API_HASH=...
+   
+   # Admin credentials for dashboard
+   ADMIN_USERNAME=admin
+   ADMIN_PASSWORD=your_secure_password
+   ADMIN_SECRET_KEY=random_secret_key_here
+   
+   # Remote Database (Turso / LibSQL)
+   LIBSQL_URL=libsql://tg-download-upload-rachelbasin.aws-ap-south-1.turso.io
+   LIBSQL_AUTH_TOKEN=your_turso_token
+   
+   # Cloudflare Tunnel (Optional)
+   CLOUDFLARE_TUNNEL_TOKEN=your_cf_tunnel_token
+   CLOUDFLARE_DOMAIN=dashboard.yourdomain.com
+   ```
+
+2. Run the bot:
+   ```bash
+   python main.py
+   # or
+   python server.py
+   ```
+   Open `http://localhost:8000` (or your Cloudflare domain) and log in with your admin credentials.
+
+## Usage Modes
+
+```bash
+python main.py                 # launches the Web Dashboard server + Cloudflare Tunnel
+python main.py --server        # explicitly launches the Web Dashboard
+python main.py --cli           # runs a single transfer job directly in CLI mode
+python main.py --dry-run       # scan only and show what would be transferred (CLI mode)
+python main.py --workers 5     # override WORKERS count
+python main.py --retry-failed  # re-queue media previously marked failed
+python search.py               # interactive terminal search for groups/channels
 ```
 
 ## Speed / VPS tuning
