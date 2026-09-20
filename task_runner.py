@@ -37,7 +37,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CHUNK_SIZE = 512 * 1024
 MIN_PARALLEL_DOWNLOAD = 4 * 1024 * 1024
 BIG_FILE_UPLOAD = 10 * 1024 * 1024
-SCAN_BATCH = 1000  # larger batches => far fewer commits/round-trips on remote DBs
+SCAN_BATCH = 200  # flush cadence for the dashboard media list; each flush is one batched commit
 METRICS_SYNC_INTERVAL = 5.0  # seconds between task_media metric syncs (was per-file)
 
 BINARY = getattr(os, "O_BINARY", 0)
