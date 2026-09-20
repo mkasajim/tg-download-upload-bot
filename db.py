@@ -40,6 +40,183 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class _ResilientCursor:
+    """Wraps a raw DB cursor and retries the last statement once after the
+    owning connection recovers from a stale Turso/libsql stream.
+
+    The raw cursor is (re)created lazily from the connection's *current*
+    raw connection so that a reconnect swaps in a fresh cursor transparently.
+    """
+
+    def __init__(self, conn: "_ResilientConnection"):
+        self._conn = conn  # _ResilientConnection
+        self._raw = None   # raw cursor for the current raw connection
+        self._stmt = None  # (kind, sql, params) of the last execute
+        self._executed = False
+
+    def _fresh_raw(self):
+        return self._conn._raw_conn().cursor()
+
+    def _run(self, kind, sql, params):
+        attempts = self._conn._db._RECONNECT_RETRIES
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                self._raw = self._fresh_raw()
+                if kind == "execute":
+                    self._raw.execute(sql, params)
+                elif kind == "executemany":
+                    self._raw.executemany(sql, params)
+                else:  # executescript
+                    self._raw.executescript(sql)
+                self._stmt = (kind, sql, params)
+                self._executed = True
+                return self
+            except Exception as e:
+                last_exc = e
+                if (self._conn._db.is_remote
+                        and self._conn._db._is_stale_stream_error(e)
+                        and attempt < attempts - 1):
+                    log.warning("Remote DB stream stale during %s (%s); reconnecting and retrying...",
+                                kind, e)
+                    self._conn._db._reconnect()
+                    continue
+                raise
+        raise last_exc
+
+    def _ensure_raw(self):
+        # A statement may be lazily executed by the driver, in which case a
+        # stale-stream error surfaces on the first fetch, not on execute().
+        if self._raw is None:
+            if self._stmt is None:
+                raise RuntimeError("cursor used before execute()")
+            kind, sql, params = self._stmt
+            self._run(kind, sql, params)
+        return self._raw
+
+    def _fetch(self, method):
+        attempts = self._conn._db._RECONNECT_RETRIES
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                raw = self._ensure_raw()
+                return getattr(raw, method)()
+            except Exception as e:
+                last_exc = e
+                if (self._conn._db.is_remote
+                        and self._conn._db._is_stale_stream_error(e)
+                        and self._stmt is not None
+                        and attempt < attempts - 1):
+                    log.warning("Remote DB stream stale during %s (%s); reconnecting and retrying...",
+                                method, e)
+                    self._conn._db._reconnect()
+                    kind, sql, params = self._stmt
+                    self._run(kind, sql, params)  # re-run on fresh connection
+                    continue
+                raise
+        raise last_exc
+
+    def execute(self, sql, params=()):
+        return self._run("execute", sql, params)
+
+    def executemany(self, sql, seq_of_params):
+        return self._run("executemany", sql, seq_of_params)
+
+    def executescript(self, sql):
+        return self._run("executescript", sql, None)
+
+    def fetchone(self):
+        return self._fetch("fetchone")
+
+    def fetchall(self):
+        return self._fetch("fetchall")
+
+    def fetchmany(self, size=None):
+        raw = self._ensure_raw()
+        return raw.fetchmany() if size is None else raw.fetchmany(size)
+
+    @property
+    def description(self):
+        return self._ensure_raw().description
+
+    @property
+    def rowcount(self):
+        return self._ensure_raw().rowcount
+
+    @property
+    def lastrowid(self):
+        return self._ensure_raw().lastrowid
+
+    def close(self):
+        try:
+            if self._raw is not None:
+                self._raw.close()
+        except Exception:
+            pass
+
+    def __iter__(self):
+        return iter(self._fetch("fetchall"))
+
+    def __getattr__(self, name):
+        return getattr(self._ensure_raw(), name)
+
+
+class _ResilientConnection:
+    """Wraps the raw connection so `db.conn.<anything>` keeps working while
+    allowing the Database to swap the underlying raw connection on reconnect.
+    """
+
+    def __init__(self, db: "Database", raw):
+        self._db = db
+        self._raw = raw
+
+    def _raw_conn(self):
+        return self._raw
+
+    def cursor(self):
+        return _ResilientCursor(self)
+
+    def commit(self):
+        attempts = self._db._RECONNECT_RETRIES
+        last_exc = None
+        for attempt in range(attempts):
+            try:
+                return self._raw.commit()
+            except Exception as e:
+                last_exc = e
+                if (self._db.is_remote
+                        and self._db._is_stale_stream_error(e)
+                        and attempt < attempts - 1):
+                    log.warning("Remote DB stream stale during commit (%s); reconnecting...", e)
+                    self._db._reconnect()
+                    # After a reconnect nothing is pending on the fresh
+                    # connection; the deferred-commit machinery will re-drive
+                    # durability on the next write cycle.
+                    return None
+                raise
+        raise last_exc
+
+    def rollback(self):
+        try:
+            return self._raw.rollback()
+        except Exception:
+            return None
+
+    def close(self):
+        try:
+            return self._raw.close()
+        except Exception:
+            return None
+
+    def execute(self, sql, params=()):
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
 class Database:
     def __init__(
         self,
@@ -62,20 +239,125 @@ class Database:
         self._dirty = False
         self._batch_depth = 0
 
+        # Watchdog that flushes a dirty-but-idle deferred transaction. Without
+        # it, a remote LibSQL/Turso write whose commit is deferred and then
+        # followed by NO further writes (e.g. the final log line emitted right
+        # after a task is paused) leaves an interactive transaction open until
+        # Turso rolls it back ("stream was idle for too long"), which both
+        # loses that write and breaks the next statement with SQLITE_BUSY.
+        self._closed = False
+        self._flush_thread: Optional[threading.Thread] = None
+        if self.commit_interval > 0:
+            self._flush_thread = threading.Thread(
+                target=self._flush_watchdog,
+                name="tg-db-flush",
+                daemon=True,
+            )
+
         self._connect()
         self._init_schema()
 
+        if self._flush_thread is not None:
+            self._flush_thread.start()
+
+    # -----------------------------------------------------------------------
+    # Stale remote connection recovery
+    # -----------------------------------------------------------------------
+    #
+    # The libsql client talks to Turso over the Hrana protocol, whose
+    # server-side streams EXPIRE after a period of inactivity (or when the
+    # database instance is restarted/migrated). Once that happens, EVERY
+    # subsequent statement on the same connection fails with:
+    #
+    #   ValueError: Hrana: `api error: `status=404 Not Found,
+    #   body={"error":"stream not found: ..."}``
+    #
+    # and the process never recovers (this previously 500'd the whole
+    # dashboard and killed worker tasks until a manual restart). The client
+    # does NOT transparently reconnect, so we detect that specific failure
+    # and re-establish the connection, then retry the statement once.
+
+    # Max total attempts for one statement (1 initial + 1 retry after reconnect).
+    _RECONNECT_RETRIES = 2
+
+    @staticmethod
+    def _is_stale_stream_error(exc: Exception) -> bool:
+        """True for transient Hrana/stream failures that a fresh connection fixes.
+
+        Covers both failure modes seen in production:
+          * 404 "stream not found"   — server-side stream expired (idle conn).
+          * SQLITE_BUSY "interactive transaction was rolled back because the
+            stream was idle for too long; retry the transaction" — a deferred
+            commit left a transaction open across an idle gap (e.g. a paused
+            task), and Turso rolled it back. The connection is then unusable
+            until rolled back / reconnected.
+        """
+        msg = str(exc).lower()
+        if "stream not found" in msg or "stream expired" in msg:
+            return True
+        if "hrana" in msg and "404" in msg:
+            return True
+        # Idle-transaction rollback / busy stream — retryable on a fresh conn.
+        if "idle for too long" in msg:
+            return True
+        if "sqlite_busy" in msg or "database is locked" in msg:
+            return True
+        if "stream error" in msg and "busy" in msg:
+            return True
+        return False
+
+    def _reconnect(self) -> None:
+        """Drop the stale raw connection and open a fresh one.
+
+        `self.conn` is a `_ResilientConnection` proxy wrapping the raw
+        connection. We open a fresh raw connection and install it IN PLACE on
+        the same proxy object, so any cursor created from `self.conn` (before
+        or after the reconnect) transparently uses the new connection.
+        """
+        proxy = self.conn
+        old_raw = proxy._raw if isinstance(proxy, _ResilientConnection) else proxy
+        # Roll back any broken in-flight interactive transaction first (Turso
+        # may have already rolled it back server-side), then close. Both can
+        # raise on a stale connection — ignore and force a fresh one.
+        try:
+            if old_raw is not None:
+                old_raw.rollback()
+        except Exception:
+            pass
+        try:
+            if old_raw is not None:
+                old_raw.close()
+        except Exception:
+            pass  # stale remote connections often fail to close cleanly
+
+        self._last_commit = time.monotonic()
+        self._dirty = False
+        self._batch_depth = 0
+        new_raw = self._open_raw()
+        if isinstance(proxy, _ResilientConnection):
+            proxy._raw = new_raw
+        else:
+            self.conn = _ResilientConnection(self, new_raw)
+        log.warning("Re-established %s database connection after stale-stream error.",
+                    "remote" if self.is_remote else "local")
+
     def _connect(self) -> None:
+        """Open the raw connection and install the resilient proxy."""
+        self.conn = _ResilientConnection(self, self._open_raw())
+
+    def _open_raw(self):
+        """The original connect logic. Returns the RAW connection and sets
+        self.is_remote. Does NOT touch self.conn (caller installs it)."""
         if self.remote_url and self.remote_url.startswith(("libsql://", "https://", "http://")):
             if libsql is None:
                 log.warning("libsql package not available. Falling back to local SQLite: %s", self.db_path)
             else:
                 try:
                     log.info("Connecting to remote LibSQL/Turso: %s", self.remote_url)
-                    self.conn = libsql.connect(self.remote_url, auth_token=self.auth_token or None)
+                    conn = libsql.connect(self.remote_url, auth_token=self.auth_token or None)
                     self.is_remote = True
                     log.info("Connected to remote Turso/LibSQL database successfully.")
-                    return
+                    return conn
                 except Exception as e:
                     log.error("Failed to connect to remote LibSQL (%s): %s. Falling back to local SQLite.", self.remote_url, e)
 
@@ -83,19 +365,20 @@ class Database:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         if libsql is not None:
             try:
-                self.conn = libsql.connect(str(self.db_path))
+                conn = libsql.connect(str(self.db_path))
                 self.is_remote = False
                 log.info("Using local database via libsql: %s", self.db_path)
-                return
+                return conn
             except Exception:
                 pass
 
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         self.is_remote = False
         log.info("Using local SQLite database: %s", self.db_path)
+        return conn
 
     def _init_schema(self) -> None:
         with self.lock:
@@ -223,6 +506,46 @@ class Database:
         """Force-commit any pending writes. Safe to call anytime."""
         with self.lock:
             self._commit()
+
+    def _flush_watchdog(self) -> None:
+        """Daemon loop: commit a dirty deferred transaction that has gone idle.
+
+        Runs at most every `commit_interval` seconds. Only acts when a write
+        marked the DB dirty but no subsequent write triggered the deferred
+        commit — exactly the pause/stop tail that otherwise leaves a remote
+        interactive transaction open until Turso rolls it back.
+        """
+        interval = max(self.commit_interval, 0.25)
+        while not self._closed:
+            time.sleep(interval)
+            if self._closed:
+                break
+            try:
+                with self.lock:
+                    if (
+                        self._dirty
+                        and self._batch_depth == 0
+                        and (time.monotonic() - self._last_commit) >= self.commit_interval
+                    ):
+                        self._commit()
+            except Exception:
+                # Never let the watchdog die; the resilient connection layer
+                # handles reconnect on the next real statement.
+                pass
+
+    def close(self) -> None:
+        """Stop the watchdog and close the connection."""
+        self._closed = True
+        try:
+            with self.lock:
+                self._commit()
+        except Exception:
+            pass
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except Exception:
+            pass
 
     @contextmanager
     def batch(self):
